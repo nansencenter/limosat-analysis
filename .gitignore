@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local data and generated outputs
+data/
+outputs/
+figures/
+*.feather
+*.parquet
+*.sqlite
+*.sqlite-*
+*.db
+*.zarr/
+*.nc
+*.tif
+*.tiff
+
+# Environment and OS files
+.env
+.DS_Store
