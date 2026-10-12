@@ -147,7 +147,7 @@ independent scientific accuracy validation. `data.metadata` and DataFrame
 
 Set `DATA_PATH` to an existing period Parquet or QC SQLite file, and choose UTC
 dates in the first cell. The defaults use `../data/201905_202007.parquet`; no data
-files are distributed with this repository.
+files are distributed with this repository. 
 
 - `notebooks/read_limosat.ipynb`: point distributions, trajectories and
   consecutive drift vectors.
@@ -170,3 +170,17 @@ The small fixtures exercise QC splits, singleton observations, date boundaries,
 shared endpoint reconstruction, large integer IDs, missing diagnostic fields,
 ownership, malformed geometry and source immutability. Local inputs and outputs
 belong in ignored `data/` and `outputs/` directories.
+
+## Example data
+
+Sample data was published by Chua et al. (2026), and can be downloaded from [Zenodo](https://zenodo.org/records/19349511) (322 MB).
+It is in legacy `feather` format and can be easily read with the Limosat reader:
+```python
+
+data = open_limosat("limosat_benchmark_reprocessed_20200101_20200430.feather")
+
+```
+
+## References
+
+Chua, S. M. T., Korosov, A., & Ólason, E. (2026). LiMOSAT: a system for deriving Lagrangian sea-ice motion from satellite data. International Journal of Remote Sensing, 1–24. https://doi.org/10.1080/01431161.2026.2709704
