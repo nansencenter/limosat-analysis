@@ -19,8 +19,9 @@ BIG_ID = 2**53 + 3
 
 # Raw observations: (rowid, image_id, time, x, y, corr, interpolated, QC
 # trajectory, QC is_last, original trajectory). Original trajectory 10 is split
-# by a removed link into QC trajectories 10 and 11; 12 is a raw singleton; the
-# only link of 13 is removed, leaving QC singletons 13 and 14.
+# by a removed link into QC trajectories 10 and 11; the only link of 13 is
+# removed, leaving single-point trajectories 13 and 14. Raw singleton 12, in no
+# link, occurs in the 2015-22 periods and has no original ID.
 POINTS = [
     (1, BIG_ID, "2023-07-29 00:00:00", 0, 0, .9, 0, 10, 0, 10),
     (2, BIG_ID + 1, "2023-07-30 00:00:00", 3, 4, .8, 1, 10, 0, 10),
@@ -151,8 +152,9 @@ def test_sqlite_native_points_and_qc_identity(qc):
     assert data.table == f"{WINDOW}__qc"
     assert data.metadata["qc_protocol_id"] == PROTOCOL and data.metadata["qc_protocol_sha256"] == PROTOCOL_SHA256
     assert data.metadata["period"] == WINDOW and data.metadata["crs"] == "EPSG:3413"
-    points = data.read_points()
+    points = data.read_points(include_singletons=True)
     assert len(points) == 8
+    assert "including single-point" in points.attrs["point_coverage"]
     assert str(points.time_utc.dtype) == "datetime64[ns, UTC]"
     by_row = points.set_index("point_rowid")
     assert by_row.loc[[4, 5], "original_trajectory_id"].tolist() == [10, 10]
@@ -165,12 +167,24 @@ def test_sqlite_native_points_and_qc_identity(qc):
     assert qc.read_bytes() == before
 
 
+def test_singletons_excluded_by_default(qc):
+    data = open_limosat(qc)
+    points = data.read_points()
+    assert sorted(points.point_rowid) == [1, 2, 3, 4, 5]
+    assert points.attrs["point_coverage"].endswith("multi-point trajectories only")
+    assert len(data.read_points(start="2023-08-01", stop="2023-08-02")) == 1
+    selected, domain = data.read_trajectories_through(start="2023-08-01", stop="2023-08-03", xlim=(400, 1000), ylim=(400, 600))
+    assert selected.empty and domain.empty
+    selected, _ = data.read_trajectories_through(start="2023-08-01", stop="2023-08-03", xlim=(400, 1000), ylim=(400, 600), include_singletons=True)
+    assert sorted(selected.trajectory_id) == [13, 14]
+
+
 def test_original_ids_need_kept_links(qc, tmp_path):
     alone = tmp_path / "alone.sqlite"
     shutil.copy(qc, alone)
     data = open_limosat(alone)
     assert data.metadata["original_trajectory_ids"].startswith("unavailable")
-    points = data.read_points()
+    points = data.read_points(include_singletons=True)
     assert points.original_trajectory_id.isna().all()
     assert points.trajectory_id.notna().all()
 
@@ -196,15 +210,18 @@ def test_parquet_matches_sqlite_and_reconstructs_unique_endpoints(qc, parquet):
     expected = sqlite_data.read_displacements(columns=columns)
     actual = parquet_data.read_displacements(columns=columns)
     assert_frame_equal(expected, actual, check_dtype=False)
-    with pytest.raises(ValueError, match="singleton"):
-        parquet_data.read_points()
-    points = parquet_data.read_points(linked_only=True)
+    with pytest.raises(ValueError, match="no single-point"):
+        parquet_data.read_points(include_singletons=True)
+    points = parquet_data.read_points()
     assert len(points) == 5 and points.trajectory_id.nunique() == 2
-    assert points.attrs["point_coverage"].startswith("linked endpoints")
+    assert points.attrs["point_coverage"].startswith("kept-link endpoints")
+    # By default both files give the same observations.
+    shared = ["trajectory_id", "original_trajectory_id", "point_rowid", "image_id", "time_utc", "x_m", "y_m", "corr", "interpolated"]
+    assert_frame_equal(sqlite_data.read_points(columns=shared), points[shared], check_dtype=False)
     assert points.image_id.max() == BIG_ID + 2
-    assert len(parquet_data.read_points(linked_only=True, start="2023-07-31", stop="2023-08-01")) == 1
+    assert len(parquet_data.read_points(start="2023-07-31", stop="2023-08-01")) == 1
     # The target-only date query must recover the incoming edge's endpoint.
-    assert len(parquet_data.read_points(linked_only=True, start="2023-08-02", stop="2023-08-03")) == 1
+    assert len(parquet_data.read_points(start="2023-08-02", stop="2023-08-03")) == 1
 
 
 def test_parquet_exposes_qc_fields_and_manifest(parquet):
@@ -253,12 +270,12 @@ def test_removed_links_with_reasons(request, source):
 @pytest.mark.parametrize("source", ["qc", "parquet"])
 def test_query_returns_full_histories_and_matching_indices(request, source):
     data = open_limosat(request.getfixturevalue(source))
-    selected, domain = data.read_trajectories_through(start="2023-07-30", stop="2023-07-31", xlim=(2, 4), ylim=(3, 5), linked_only=True)
+    selected, domain = data.read_trajectories_through(start="2023-07-30", stop="2023-07-31", xlim=(2, 4), ylim=(3, 5))
     assert len(selected) == 3 and len(domain) == 1
     assert selected.time_utc.min() == pd.Timestamp("2023-07-29", tz="UTC")
     assert selected.time_utc.max() == pd.Timestamp("2023-07-31", tz="UTC")
     assert selected.loc[domain.index, "time_utc"].tolist() == domain.time_utc.tolist()
-    empty, domain = data.read_trajectories_through(start="2023-07-30", stop="2023-07-31", xlim=(-5, -1), ylim=(-5, -1), linked_only=True)
+    empty, domain = data.read_trajectories_through(start="2023-07-30", stop="2023-07-31", xlim=(-5, -1), ylim=(-5, -1))
     assert empty.empty and domain.empty
 
 
@@ -278,7 +295,7 @@ def test_projection_and_preview(parquet):
     projected = data.read_displacements(columns=columns)
     assert list(projected) == columns and len(projected) == 3
     assert len(data.read_displacements(max_rows=1)) == 1
-    assert len(data.read_points(linked_only=True, max_rows=1)) == 1
+    assert len(data.read_points(max_rows=1)) == 1
     with pytest.raises(ValueError, match="Unavailable"):
         data.read_displacements(columns=["speed_m_s"])
     with pytest.raises(ValueError, match="positive integer"):
@@ -348,12 +365,15 @@ def test_raw_sqlite_requires_crs(tmp_path):
         conn.executemany(f'INSERT INTO "{WINDOW}" VALUES (?,?,?,?,?)', [
             (1, 5, "2023-05-01 00:00:00.000000", "POINT (0 0)", 0),
             (2, 5, "2023-05-02 00:00:00.000000", "POINT (3 4)", 1),
+            (3, 6, "2023-05-01 00:00:00.000000", "POINT (9 9)", 1),
         ])
     with pytest.raises(ValueError, match="supply crs"):
         open_limosat(path)
     data = open_limosat(path, crs="EPSG:3413")
     assert data.metadata["qc_protocol_id"] is None and data.metadata["period"] == WINDOW
     points = data.read_points()
+    assert points.trajectory_id.tolist() == [5, 5]
+    assert len(data.read_points(include_singletons=True)) == 3
     assert "original_trajectory_id" not in points and "qc_trajectory_id" not in points
     assert data.read_displacements().speed_m_per_day.tolist() == [5.]
     with pytest.raises(ValueError, match="ownership"):
@@ -364,10 +384,12 @@ def test_raw_sqlite_requires_crs(tmp_path):
 
 def test_basic_feather_and_crs(tmp_path):
     path = tmp_path / "legacy.feather"
-    feather.write_feather(pd.DataFrame({"g": [1, 1], "d": pd.to_datetime(["2023-05-01", "2023-05-02"]), "x": [0., 3.], "y": [0., 4.]}), path)
+    feather.write_feather(pd.DataFrame({"g": [1, 1, 2], "d": pd.to_datetime(["2023-05-01", "2023-05-02", "2023-05-01"]), "x": [0., 3., 9.], "y": [0., 4., 9.]}), path)
     with pytest.raises(ValueError, match="supply crs"):
         open_limosat(path)
     data = open_limosat(path, crs="EPSG:3412")
+    assert data.read_points().trajectory_id.tolist() == [1, 1]
+    assert len(data.read_points(include_singletons=True, start="2023-05-01", stop="2023-05-02")) == 2
     assert data.read_points().image_id.isna().all()
     assert data.read_points()["corr"].isna().all()
     assert data.read_displacements().speed_m_per_day.tolist() == [5.]
@@ -382,11 +404,11 @@ def test_geometry_date_and_precision_errors(qc):
         open_limosat(qc, crs="EPSG:3412")
     with sqlite3.connect(qc) as conn:
         conn.execute(f'UPDATE "{WINDOW}__qc" SET time=? WHERE trajectory_id=12', ("2023-07-30 00:00:00.000001",))
-    assert len(data.read_points(start="2023-07-30T00:00:00.000001Z", stop="2023-07-30T00:00:00.000002Z")) == 1
+    assert len(data.read_points(start="2023-07-30T00:00:00.000001Z", stop="2023-07-30T00:00:00.000002Z", include_singletons=True)) == 1
     with sqlite3.connect(qc) as conn:
         conn.execute(f'UPDATE "{WINDOW}__qc" SET geometry="LINESTRING (0 0, 1 1)" WHERE trajectory_id=12')
     with pytest.raises(ValueError, match="POINT geometry"):
-        data.read_points()
+        data.read_points(include_singletons=True)
 
 
 def test_repeated_time_retained_without_infinite_speed(qc):
@@ -404,11 +426,11 @@ def test_shared_endpoint_conflict_is_reported(parquet):
     links.loc[links.source_rowid == 2, "x0_m"] += 1
     write_kept(parquet, links)
     with pytest.raises(ValueError, match="shared observation"):
-        open_limosat(parquet).read_points(linked_only=True)
+        open_limosat(parquet).read_points()
 
 
 def test_missing_point_time_is_reported(qc):
     with sqlite3.connect(qc) as conn:
         conn.execute(f'UPDATE "{WINDOW}__qc" SET time=NULL WHERE trajectory_id=12')
     with pytest.raises(ValueError, match="Missing observation timestamp"):
-        open_limosat(qc).read_points()
+        open_limosat(qc).read_points(include_singletons=True)

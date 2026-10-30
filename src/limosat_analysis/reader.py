@@ -307,8 +307,15 @@ class LimosatDataset:
         frame["period"] = self.metadata.get("period", self.path.stem)
         return frame
 
-    def _point_query(self, start=None, stop=None, trajectory_ids=None):
+    def _point_query(self, start=None, stop=None, trajectory_ids=None, include_singletons=True):
         where, params = [], []
+        if not include_singletons:
+            table = _quote(self.table)
+            if self.metadata["qc_protocol_id"]:
+                # Seeks the QC table's trajectory index once per candidate row.
+                where.append(f"EXISTS (SELECT 1 FROM {table} AS other WHERE other.trajectory_id = {table}.trajectory_id AND other.rowid <> {table}.rowid)")
+            else:
+                where.append(f"trajectory_id IN (SELECT trajectory_id FROM {table} GROUP BY trajectory_id HAVING count(*) > 1)")
         # LiMOSAT SQLite stores UTC as sortable naive datetime text. Text
         # comparisons preserve microseconds that julianday would round away.
         if start is not None:
@@ -323,23 +330,27 @@ class LimosatDataset:
         suffix = " WHERE " + " AND ".join(where) if where else ""
         return suffix, params
 
-    def read_points(self, *, start=None, stop=None, trajectory_ids=None, columns=None, linked_only=False, max_rows=None):
-        """Read observations, or explicitly reconstruct linked Parquet endpoints.
+    def read_points(self, *, start=None, stop=None, trajectory_ids=None, columns=None, include_singletons=False, max_rows=None):
+        """Read observations of multi-point trajectories.
 
-        Link Parquet cannot recover singleton trajectories. Missing image IDs or
-        correlation values in legacy Feather remain missing, never fabricated.
+        Single-point trajectories, mostly points whose every link QC removed,
+        carry no displacement and are excluded unless ``include_singletons``;
+        link Parquet cannot provide them. Parquet points are reconstructed link
+        endpoints. Missing image IDs or correlation values in legacy Feather
+        remain missing, never fabricated.
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)
+        coverage = "including single-point trajectories" if include_singletons else "multi-point trajectories only"
         if self._links is not None:
-            if not linked_only:
-                raise ValueError("QC link Parquet excludes singleton observations; use linked_only=True or the QC SQLite for complete points")
+            if include_singletons:
+                raise ValueError("QC link Parquet has no single-point trajectories; use the QC SQLite")
             links = self._read_parquet(start, stop, trajectory_ids, endpoint_times=True, max_rows=max_rows)
             frame = self._endpoints(links)
             frame = frame.loc[_time_mask(frame.time_utc, start, stop)].copy()
-            metadata = {**self.metadata, "point_coverage": "linked endpoints only; singletons unavailable"}
+            metadata = {**self.metadata, "point_coverage": f"kept-link endpoints; {coverage}"}
         elif self.kind == "sqlite_points":
-            suffix, params = self._point_query(start, stop, trajectory_ids)
+            suffix, params = self._point_query(start, stop, trajectory_ids, include_singletons)
             query = f"SELECT rowid AS point_rowid, {', '.join(map(_quote, self._point_fields))} FROM {_quote(self.table)}{suffix}"
             if max_rows is not None:
                 query += " LIMIT ?"
@@ -347,7 +358,7 @@ class LimosatDataset:
             with _connect(self.path) as conn:
                 frame = pd.read_sql_query(query, conn, params=params)
             frame = self._normalize_points(frame)
-            metadata = {**self.metadata, "point_coverage": "native observations"}
+            metadata = {**self.metadata, "point_coverage": f"native observations; {coverage}"}
         else:
             frame = feather.read_table(self.path).to_pandas().rename(columns={"i": "image_id", "g": "trajectory_id", "d": "time_utc", "x": "x_m", "y": "y_m", "q": "corr"})
             missing = {"trajectory_id", "time_utc", "x_m", "y_m"} - set(frame)
@@ -357,8 +368,10 @@ class LimosatDataset:
             mask = _time_mask(frame.time_utc, start, stop)
             if trajectory_ids is not None:
                 mask &= frame.trajectory_id.isin(trajectory_ids)
+            if not include_singletons:
+                mask &= frame.trajectory_id.duplicated(keep=False)
             frame = frame.loc[mask].copy()
-            metadata = {**self.metadata, "point_coverage": "native observations"}
+            metadata = {**self.metadata, "point_coverage": f"native observations; {coverage}"}
         return _finish(frame, columns, metadata, max_rows)
 
     def _read_parquet(self, start, stop, trajectory_ids, *, endpoint_times=False, columns=None, max_rows=None, flag_mask=0):
@@ -446,7 +459,7 @@ class LimosatDataset:
                     ids = [row[0] for row in conn.execute(f"SELECT DISTINCT trajectory_id FROM {_quote(self.table)}{suffix}", params)]
             # Fetch complete histories before pairing: filtering points first
             # would remove links whose target lies beyond the stop boundary.
-            points = self.read_points(trajectory_ids=ids)
+            points = self.read_points(trajectory_ids=ids, include_singletons=True)
             frame = self._pair_points(points)
             frame = frame.loc[_time_mask(frame.start_time_utc, start, stop)].copy()
         metadata = {**self.metadata, "ownership_applied": owned_only, "excluded_flags": sorted(set(exclude_flags)), "time_filter": "displacement start time"}
@@ -535,7 +548,7 @@ class LimosatDataset:
         frame["speed_m_per_day"] = frame.distance_m / frame.elapsed_seconds.where(frame.positive_elapsed) * 86_400
         return frame
 
-    def read_trajectories_through(self, *, start, stop, xlim, ylim, linked_only=False):
+    def read_trajectories_through(self, *, start, stop, xlim, ylim, include_singletons=False):
         """Return full trajectories and matching points for an endpoint query.
 
         Spatial bounds are inclusive projected metres. A trajectory matches if
@@ -545,10 +558,10 @@ class LimosatDataset:
         start, stop = _bounds(start, stop)
         if xlim[0] > xlim[1] or ylim[0] > ylim[1]:
             raise ValueError("Expected increasing xlim and ylim bounds")
-        candidates = self.read_points(start=start, stop=stop, linked_only=linked_only)
+        candidates = self.read_points(start=start, stop=stop, include_singletons=include_singletons)
         inside = candidates.x_m.between(*xlim) & candidates.y_m.between(*ylim)
         ids = candidates.loc[inside, "trajectory_id"].unique()
-        selected = self.read_points(trajectory_ids=ids, linked_only=linked_only)
+        selected = self.read_points(trajectory_ids=ids, include_singletons=include_singletons)
         in_domain = _time_mask(selected.time_utc, start, stop) & selected.x_m.between(*xlim) & selected.y_m.between(*ylim)
         domain = selected.loc[in_domain].copy()
         return selected, domain

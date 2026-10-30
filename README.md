@@ -28,7 +28,7 @@ files together, as the reader uses the neighbouring files.
 | Input | Contents | Reader behaviour |
 | --- | --- | --- |
 | QC v1 kept-link Parquet (`<period>_qc.parquet`) | Kept links with QC and original trajectory IDs, endpoint state, `qc_flags`, `pair_direct_share`, SIC and neighbour counts | Validates the QC v1 link schema and the `<period>_qc.manifest.json` sidecar (status complete, zero continuity violations, known protocol id and SHA-256, cross-checked with the Arrow `limosat.qc` metadata). Reads links directly; removed links come from `<period>_qc_removed.parquet`. |
-| QC v1 SQLite (`<period>_qc.sqlite`) | Every raw observation in `<period>__qc`, with `trajectory_id` and `is_last` rewritten to QC trajectories; `qc_removed_links`; `qc_metadata` | Selects the QC table and validates `qc_metadata` as above. Excludes descriptors, decodes POINT WKT and derives links within QC trajectories. Original trajectory IDs come from the kept and removed links by rowid. |
+| QC v1 SQLite (`<period>_qc.sqlite`) | Every raw observation in `<period>__qc`, with `trajectory_id` and `is_last` rewritten to QC trajectories; `qc_removed_links`; `qc_metadata` | Selects the QC table and validates `qc_metadata` as above. Excludes descriptors and single-point trajectories (opt in with `include_singletons=True`), decodes POINT WKT and derives links within QC trajectories. Original trajectory IDs come from the kept and removed links by rowid. |
 | Raw SQLite (`.sqlite`, `.db`) | One raw observation table | Requires an explicit CRS and is labelled as raw data; reading it does not apply QC. Use `table=` to resolve ambiguous tables. |
 | Legacy point Feather (`.feather`) | `i`, `g`, `d`, `x`, `y`, `q`, or a point table with descriptive headings | Renames legacy fields; optional image IDs and correlation can be missing. An explicit CRS is required when absent. |
 
@@ -50,15 +50,23 @@ period = Path("data/limosat_qc_v1_20261029/202305_202407")
 data = open_limosat(period / "202305_202407_qc.parquet")
 links = data.read_displacements(start="2024-01-01", stop="2024-02-01")
 
-# Native observations, including singleton trajectories, from QC SQLite.
+# Observations of multi-point QC trajectories, from QC SQLite.
 qc = open_limosat(period / "202305_202407_qc.sqlite")
 points = qc.read_points(start="2024-01-01", stop="2024-01-04")
 
-# Explicitly recover linked endpoints from kept-link Parquet.
-linked_points = data.read_points(
-    start="2024-01-01", stop="2024-01-04", linked_only=True
-)
+# The same observations, reconstructed from kept-link endpoints.
+linked_points = data.read_points(start="2024-01-01", stop="2024-01-04")
 ```
+
+`read_points()` returns only observations of trajectories with at least two
+points, from every input. Single-point trajectories carry no displacement. In
+QC v1 they are mostly points whose every link was removed, plus points that
+were never linked (none in 2022-25): 13.8 M of 36.5 M QC trajectories across
+the ten periods, 4.4% of observations (14% in 202305_202407). The QC SQLite
+keeps them;
+`include_singletons=True` returns them from SQLite or Feather. Link Parquet
+cannot provide them. With the default, both QC v1 files give the same
+observations.
 
 Point headings are `image_id`, `trajectory_id`, `time_utc`, `x_m`, `y_m`, `corr`,
 plus available native state and provenance. `corr` is the native correlation
@@ -135,7 +143,6 @@ reproject coordinates and cannot override a conflicting known CRS.
 selected, domain_points = data.read_trajectories_through(
     start="2024-02-20", stop="2024-02-25",
     xlim=(500_000, 900_000), ylim=(-1_000_000, -600_000),
-    linked_only=True,
 )
 ```
 
@@ -144,11 +151,8 @@ spatial box and half-open date interval, then returns their complete available
 histories in the selected period. `domain_points` retains indices from
 `selected`. It does not test segment intersections with the box.
 
-Parquet endpoint reconstruction removes shared endpoint duplicates. It cannot
-recover singleton observations, or observations absent from the kept links.
-`read_points()` therefore requires `linked_only=True` for link Parquet. QC
-SQLite remains the source for complete observation counts. Point coverage is
-recorded in the returned DataFrame's `attrs`.
+Parquet endpoint reconstruction removes shared endpoint duplicates. Point
+coverage is recorded in the returned DataFrame's `attrs`.
 
 ### Filtering and practical limits
 
@@ -222,7 +226,7 @@ python -m pytest -q
 ```
 
 The small synthetic fixtures follow the QC v1 release layout. They exercise QC
-splits, singleton observations, original IDs by rowid, flags, removed links,
+splits, single-point trajectories, original IDs by rowid, flags, removed links,
 manifest validation, date and ownership boundaries, shared endpoint
 reconstruction, large integer IDs, malformed geometry and source immutability.
 Local inputs and outputs belong in ignored `data/` and `outputs/` directories.
