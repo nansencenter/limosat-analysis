@@ -1,4 +1,4 @@
-"""Read-only adapters for LiMOSAT QC SQLite and displacement Parquet."""
+"""Read-only adapters for LiMOSAT QC v1 releases and legacy point files."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.feather as feather
 import pyarrow.parquet as pq
@@ -17,8 +18,37 @@ POINT_COLUMNS = ["image_id", "trajectory_id", "time_utc", "x_m", "y_m", "corr"]
 LINK_COLUMNS = [
     "source_image_id", "target_image_id", "start_time_utc", "end_time_utc",
     "x0_m", "y0_m", "x1_m", "y1_m", "elapsed_seconds", "dx_m", "dy_m",
-    "distance_m", "speed_m_s", "speed_m_per_day",
+    "distance_m", "speed_m_per_day",
 ]
+ENDPOINT_FIELDS = ("interpolated", "corr", "orbit_num", "is_last", "stopped", "converged_to")
+QC_BASE_COLUMNS = [
+    "edge_uid", "original_trajectory_id", "trajectory_link_index", "source_rowid", "target_rowid",
+    *LINK_COLUMNS, *(f"{prefix}_{name}" for prefix in ("source", "target") for name in ENDPOINT_FIELDS),
+    "pair_direct_share",
+]
+QC_LINK_COLUMNS = QC_BASE_COLUMNS + [
+    "qc_trajectory_id", "qc_segment", "qc_flags", "qc_flag_reasons",
+    "qc_sic_start", "qc_sic_end", "qc_neighbours_30km",
+]
+QC_REMOVED_COLUMNS = QC_BASE_COLUMNS + ["qc_exclusion"]
+QC_PROTOCOLS = {"limosat_qc_v1_draft_20261028": "e91d7a9c8e9588650f90125ea804d4d04aae629dca422aceec6efb878394fff3"}
+QC_FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1}
+QC_CRS = "EPSG:3413"
+# Release date ownership of link start times, half-open. Matches the
+# canonical_ownership intervals of the ten-period displacement package.
+OWNERSHIP_POLICY = "limosat_release_august_annual_v1"
+OWNERSHIP = {
+    "201505_201607": ("2015-05-01", "2016-08-01"),
+    "201605_201707": ("2016-08-01", "2017-08-01"),
+    "201705_201807": ("2017-08-01", "2018-08-01"),
+    "201805_201907": ("2018-08-01", "2019-08-01"),
+    "201905_202007": ("2019-08-01", "2020-08-01"),
+    "202005_202107": ("2020-08-01", "2021-08-01"),
+    "202105_202207": ("2021-08-01", "2022-08-01"),
+    "202205_202307": ("2022-08-01", "2023-08-01"),
+    "202305_202407": ("2023-08-01", "2024-08-01"),
+    "202405_202507": ("2024-08-01", "2025-08-01"),
+}
 POINT_PATTERN = r"^\s*POINT\s*(?:Z\s*)?\(\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)(?:\s+[-+0-9.eE]+)?\s*\)\s*$"
 
 
@@ -55,8 +85,17 @@ def _time_mask(values, start, stop):
     return mask
 
 
+def _time_expression(field, start, stop):
+    expression = ds.scalar(True)
+    if start is not None:
+        expression &= ds.field(field) >= pa.scalar(start, type=pa.timestamp("ns", tz="UTC"))
+    if stop is not None:
+        expression &= ds.field(field) < pa.scalar(stop, type=pa.timestamp("ns", tz="UTC"))
+    return expression
+
+
 def _finish(frame, columns, metadata, max_rows=None):
-    keys = [key for key in ("canonical_source_window", "trajectory_id", "time_utc", "start_time_utc", "image_id", "source_image_id", "point_rowid", "source_rowid") if key in frame]
+    keys = [key for key in ("period", "trajectory_id", "original_trajectory_id", "time_utc", "trajectory_link_index", "start_time_utc", "image_id", "source_image_id", "point_rowid", "source_rowid") if key in frame]
     if keys:
         frame = frame.sort_values(keys, kind="stable")
     if max_rows is not None:
@@ -79,6 +118,38 @@ def _limit(max_rows):
         raise ValueError("max_rows must be a positive integer")
 
 
+def _qc_metadata(manifest, period=None):
+    """Validate QC v1 manifest fields and return the reader metadata they imply."""
+    if manifest.get("status") != "complete" or manifest.get("continuity_violations") != 0:
+        raise ValueError("QC output is not recorded as complete with zero continuity violations")
+    if period is not None and manifest.get("period") != period:
+        raise ValueError(f"QC metadata period {manifest.get('period')!r} differs from {period!r}")
+    protocol = manifest.get("protocol_id")
+    if protocol not in QC_PROTOCOLS or manifest.get("protocol_sha256") != QC_PROTOCOLS[protocol]:
+        raise ValueError(f"Unsupported QC protocol {protocol!r}; expected LiMOSAT QC v1")
+    metadata = {
+        "period": manifest["period"], "crs": QC_CRS, "qc_protocol_id": protocol,
+        "qc_protocol_sha256": manifest["protocol_sha256"], "qc_flag_bits": dict(QC_FLAG_BITS),
+    }
+    if manifest["period"] in OWNERSHIP:
+        start, stop = OWNERSHIP[manifest["period"]]
+        metadata["ownership"] = {"policy_id": OWNERSHIP_POLICY, "start": start, "stop_exclusive": stop}
+    return metadata
+
+
+def _link_types(frame):
+    for name in ("source_image_id", "target_image_id", "source_orbit_num", "target_orbit_num", "source_converged_to", "target_converged_to"):
+        if name in frame:
+            frame[name] = frame[name].astype("Int64")
+    for name in ("local_supported", "direct"):
+        if name in frame:
+            frame[name] = frame[name].astype("boolean")
+    for name in ("start_time_utc", "end_time_utc"):
+        if name in frame:
+            frame[name] = pd.to_datetime(frame[name], utc=True, format="ISO8601", errors="raise").astype("datetime64[ns, UTC]")
+    return frame
+
+
 class LimosatDataset:
     """A single source period, with explicit point and displacement views.
 
@@ -89,32 +160,32 @@ class LimosatDataset:
     def __init__(self, path, *, table=None, crs=None):
         self.path = Path(path).expanduser().resolve()
         self.table = None
-        self._manifest = {}
-        self._arrow = None
-        self._original_ids = None
-        self.metadata = {"source_path": str(self.path), "crs": None, "qc_materialized": False}
+        self._links = None
+        self._kept_links = None
+        self.metadata = {"source_path": str(self.path), "crs": None, "qc_protocol_id": None}
         if not self.path.exists():
             raise FileNotFoundError(self.path)
-        if self.path.suffix.lower() in {".sqlite", ".db"}:
+        suffix = self.path.suffix.lower()
+        if self.path.is_dir():
+            raise ValueError("Choose one period file; combining periods needs an explicit ownership policy")
+        if table is not None and suffix not in {".sqlite", ".db"}:
+            raise ValueError("table applies only to SQLite")
+        if suffix in {".sqlite", ".db"}:
             self._inspect_sqlite(table)
-        elif self.path.is_dir() or self.path.suffix.lower() == ".parquet":
-            if table is not None:
-                raise ValueError("table applies only to SQLite")
+        elif suffix == ".parquet":
             self._inspect_parquet()
-        elif self.path.suffix.lower() == ".feather":
-            if table is not None:
-                raise ValueError("table applies only to SQLite")
+        elif suffix == ".feather":
             self.kind = "feather_points"
             self.metadata["legacy_quality_assumption"] = "q is interpreted as historical correlation"
         else:
-            raise ValueError("Expected a SQLite, Parquet, Feather file or a monthly displacement-store directory")
+            raise ValueError("Expected a SQLite, Parquet or Feather file")
         known_crs = self.metadata["crs"]
         if crs is not None and known_crs is not None and crs.upper() != known_crs.upper():
             raise ValueError(f"Source CRS is {known_crs}; crs does not reproject coordinates")
         self.metadata["crs"] = known_crs or crs
         if self.metadata["crs"] is None:
             raise ValueError("Source has no CRS metadata; supply crs explicitly")
-        self.metadata.setdefault("canonical_source_window", self.path.stem)
+        self.metadata.setdefault("period", self.path.stem)
         self.metadata["kind"] = self.kind
         self.metadata["time_convention"] = "UTC; start inclusive, stop exclusive"
         self.metadata["coordinate_units"] = "metres"
@@ -143,97 +214,71 @@ class LimosatDataset:
                 if not isinstance(value, str) or len(value) < 19 or value[10] != " " or pd.Timestamp(value).tzinfo is not None:
                     raise ValueError("Expected LiMOSAT SQLite times as naive UTC 'YYYY-MM-DD HH:MM:SS' text")
             if table.endswith("__qc"):
-                if "qc_materialization_manifest" not in names:
-                    raise ValueError("QC table has no materialization manifest")
-                row = conn.execute("SELECT manifest_json FROM qc_materialization_manifest LIMIT 1").fetchone()
-                manifest = json.loads(row[0]) if row else {}
-                if manifest.get("status") != "complete" or manifest.get("quick_check") != "ok":
-                    raise ValueError("QC materialization is not recorded as complete with quick_check: ok")
-                if manifest.get("cleaned_table", table) != table:
-                    raise ValueError("Selected table differs from the QC materialization manifest")
-                self.metadata.update(qc_materialized=True, crs="EPSG:3413")
-                self.metadata["canonical_source_window"] = table.removesuffix("__qc")
+                if "qc_metadata" not in names or "qc_removed_links" not in names:
+                    raise ValueError("QC table has no qc_metadata/qc_removed_links; only LiMOSAT QC v1 SQLite is supported")
+                manifest = {key: json.loads(value) for key, value in conn.execute("SELECT key, value_json FROM qc_metadata")}
+                self.metadata.update(_qc_metadata(manifest, table.removesuffix("__qc")))
+                if self.path.with_suffix(".parquet").is_file():
+                    self.metadata["original_trajectory_ids"] = "from kept and removed links by rowid; missing for observations in no link"
+                else:
+                    self.metadata["original_trajectory_ids"] = "unavailable: no kept-link Parquet beside the SQLite"
             else:
-                self.metadata["canonical_source_window"] = table
+                self.metadata["period"] = table
 
     def _inspect_parquet(self):
-        if self.path.is_dir():
-            manifest_path = self.path / "manifest.json"
-            if not manifest_path.is_file():
-                raise ValueError("Monthly displacement store requires manifest.json")
-            self._manifest = json.loads(manifest_path.read_text())
-            if "windows" in self._manifest:
-                raise ValueError("Choose one period Parquet file; multi-period concatenation needs explicit ownership")
-            if self._manifest.get("status") != "complete" or self._manifest.get("store_format_version") != 2:
-                raise ValueError("Expected a complete v2 monthly displacement store")
-            files = []
-            for record in self._manifest["partitions"]:
-                part = (self.path / record["path"]).resolve()
-                if not part.is_relative_to(self.path):
-                    raise ValueError("Partition path escapes the displacement store")
-                files.append(str(part))
-        else:
-            files = [str(self.path)]
-            sidecar = self.path.with_suffix(".manifest.json")
-            if sidecar.is_file():
-                self._manifest = json.loads(sidecar.read_text())
-            else:
-                for parent in list(self.path.parents)[:5]:
-                    manifest_path = parent / "manifest.json"
-                    if manifest_path.is_file():
-                        candidate = json.loads(manifest_path.read_text())
-                        if candidate.get("store_format_version") == 2:
-                            self._manifest = candidate
-                            break
-        if not files:
-            raise ValueError("No Parquet partitions recorded in store")
-        schema = pq.ParquetFile(files[0]).schema_arrow
-        for file in files[1:]:
-            if not pq.ParquetFile(file).schema_arrow.equals(schema):
-                raise ValueError(f"Partition schema differs: {file}")
+        schema = pq.ParquetFile(self.path).schema_arrow
         fields = set(schema.names)
+        if "qc_exclusion" in fields:
+            raise ValueError("This is a removed-link file; open the kept-link Parquet and use read_removed_links()")
+        missing = set(QC_LINK_COLUMNS) - fields
+        if missing:
+            raise ValueError(f"Expected the LiMOSAT QC v1 link schema; missing {sorted(missing)}")
         for name in ("start_time_utc", "end_time_utc"):
-            if name in fields:
-                dtype = schema.field(name).type
-                if not pa.types.is_timestamp(dtype) or dtype.tz != "UTC":
-                    raise ValueError("Expected UTC timestamp columns in displacement Parquet")
-        if not set(LINK_COLUMNS) <= fields or not ({"trajectory_id", "qc_trajectory_id"} & fields):
-            raise ValueError("Expected the LiMOSAT displacement Parquet schema")
-        if "qc_trajectory_id" in fields:
-            if not {"canonical_source_window", "source_rowid", "target_rowid", "original_trajectory_id"} <= fields:
-                raise ValueError("Incomplete v2 displacement identity columns")
-            self.kind = "parquet_displacements_v2"
-            self.metadata.update(crs="EPSG:3413", qc_materialized=True)
-        else:
-            self.kind = "parquet_displacements_v1"
-        arrow_metadata = {key.decode(): value.decode() for key, value in (schema.metadata or {}).items() if key.startswith(b"limosat.")}
-        self.metadata["crs"] = arrow_metadata.get("limosat.crs", self.metadata["crs"])
-        window = self._manifest.get("window") or arrow_metadata.get("limosat.source_window")
-        if window:
-            self.metadata["canonical_source_window"] = window
-        release = self._manifest.get("source_qc_release_id") or self._manifest.get("qc_release_id") or arrow_metadata.get("limosat.release_id")
-        if release:
-            self.metadata["qc_release_id"] = release
-        if self.kind == "parquet_displacements_v1" and release:
-            self.metadata["qc_materialized"] = True
-        self.metadata["canonical_ownership"] = self._manifest.get("canonical_ownership")
-        self._arrow = ds.dataset(files, format="parquet")
+            dtype = schema.field(name).type
+            if not pa.types.is_timestamp(dtype) or dtype.tz != "UTC":
+                raise ValueError("Expected UTC timestamp columns in QC v1 Parquet")
+        if not pa.types.is_integer(schema.field("qc_flags").type):
+            raise ValueError("Expected integer qc_flags bits in QC v1 Parquet")
+        sidecar = self.path.with_suffix(".manifest.json")
+        if not sidecar.is_file():
+            raise ValueError(f"QC v1 Parquet requires its manifest: {sidecar.name}")
+        self.metadata.update(_qc_metadata(json.loads(sidecar.read_text())))
+        arrow = json.loads((schema.metadata or {}).get(b"limosat.qc", b"{}"))
+        if arrow.get("protocol_id") != self.metadata["qc_protocol_id"] or arrow.get("flag_bits") != QC_FLAG_BITS:
+            raise ValueError("Parquet limosat.qc metadata disagrees with the manifest protocol or flag bits")
+        self.kind = "parquet_qc_links"
+        self._links = ds.dataset(self.path, format="parquet")
         self._link_fields = fields
 
-    def _original_map(self):
-        if self._original_ids is None:
-            mapping = {}
-            with _connect(self.path) as conn:
-                names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                for table in ("qc_break_assignment", "qc_duplicate_assignment"):
-                    if table in names:
-                        rows = conn.execute(f"SELECT new_trajectory_id, original_trajectory_id FROM {table} WHERE new_trajectory_id IS NOT NULL")
-                        for new, original in rows:
-                            if new in mapping and mapping[new] != original:
-                                raise ValueError("QC trajectory maps to conflicting original IDs")
-                            mapping[new] = original
-            self._original_ids = mapping
-        return self._original_ids
+    def _original_ids(self, rowids):
+        """Map observation rowids to original trajectories through QC links.
+
+        Observations in no kept or removed link remain missing; the QC
+        trajectory ID is never substituted.
+        """
+        original = pd.array(np.full(len(rowids), pd.NA), dtype="Int64")
+        kept_path = self.path.with_suffix(".parquet")
+        if not kept_path.is_file() or rowids.empty:
+            return original
+        if self._kept_links is None:
+            kept = LimosatDataset(kept_path)
+            if any(kept.metadata[key] != self.metadata[key] for key in ("period", "qc_protocol_sha256")):
+                raise ValueError("Kept-link Parquet belongs to a different period or QC protocol")
+            self._kept_links = kept
+        wanted = pa.array(rowids.unique().astype("int64"))
+        columns = ["source_rowid", "target_rowid", "original_trajectory_id"]
+        expression = ds.field("source_rowid").isin(wanted) | ds.field("target_rowid").isin(wanted)
+        kept = self._kept_links._links.to_table(columns=columns, filter=expression).to_pandas()
+        with _connect(self.path) as conn:
+            removed = pd.read_sql_query(f"SELECT {', '.join(columns)} FROM qc_removed_links", conn)
+        pairs = pd.concat([
+            frame[[f"{end}_rowid", "original_trajectory_id"]].set_axis(["rowid", "original"], axis=1)
+            for frame in (kept, removed) for end in ("source", "target")
+        ]).drop_duplicates()
+        if pairs.rowid.duplicated().any():
+            raise ValueError("An observation maps to conflicting original trajectory IDs")
+        lookup = pairs.set_index("rowid").original.astype("Int64")
+        return lookup.reindex(rowids.to_numpy(dtype="int64")).array
 
     def _normalize_points(self, frame):
         if "time" in frame:
@@ -256,12 +301,10 @@ class LimosatDataset:
             frame["image_id"] = pd.Series(pd.NA, index=frame.index, dtype="Int64")
         if "corr" not in frame:
             frame["corr"] = np.nan
-        if self.metadata.get("qc_materialized"):
+        if self.metadata["qc_protocol_id"]:
             frame["qc_trajectory_id"] = frame.trajectory_id
-            mapping = self._original_map() if self.kind == "sqlite_points" else {}
-            if self.kind == "sqlite_points":
-                frame["original_trajectory_id"] = pd.array([mapping.get(value, value) for value in frame.trajectory_id], dtype="Int64")
-        frame["canonical_source_window"] = self.metadata.get("canonical_source_window", self.path.stem)
+            frame["original_trajectory_id"] = self._original_ids(frame.point_rowid)
+        frame["period"] = self.metadata.get("period", self.path.stem)
         return frame
 
     def _point_query(self, start=None, stop=None, trajectory_ids=None):
@@ -288,9 +331,9 @@ class LimosatDataset:
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)
-        if self._arrow is not None:
+        if self._links is not None:
             if not linked_only:
-                raise ValueError("Displacement Parquet excludes singleton observations; use linked_only=True or the QC SQLite for complete points")
+                raise ValueError("QC link Parquet excludes singleton observations; use linked_only=True or the QC SQLite for complete points")
             links = self._read_parquet(start, stop, trajectory_ids, endpoint_times=True, max_rows=max_rows)
             frame = self._endpoints(links)
             frame = frame.loc[_time_mask(frame.time_utc, start, stop)].copy()
@@ -318,107 +361,83 @@ class LimosatDataset:
             metadata = {**self.metadata, "point_coverage": "native observations"}
         return _finish(frame, columns, metadata, max_rows)
 
-    def _read_parquet(self, start, stop, trajectory_ids, *, endpoint_times=False, columns=None, max_rows=None):
-        def time_filter(field):
-            expression = ds.scalar(True)
-            for value, comparison in ((start, "start"), (stop, "stop")):
-                if value is not None:
-                    scalar = pa.scalar(value, type=pa.timestamp("ns", tz="UTC"))
-                    expression &= ds.field(field) >= scalar if comparison == "start" else ds.field(field) < scalar
-            return expression
-        expression = time_filter("start_time_utc")
+    def _read_parquet(self, start, stop, trajectory_ids, *, endpoint_times=False, columns=None, max_rows=None, flag_mask=0):
+        expression = _time_expression("start_time_utc", start, stop)
         if endpoint_times:
-            expression |= time_filter("end_time_utc")
-        id_field = "qc_trajectory_id" if "qc_trajectory_id" in self._link_fields else "trajectory_id"
+            expression |= _time_expression("end_time_utc", start, stop)
         if trajectory_ids is not None:
-            expression &= ds.field(id_field).isin([int(value) for value in trajectory_ids])
+            expression &= ds.field("qc_trajectory_id").isin([int(value) for value in trajectory_ids])
+        if flag_mask:
+            expression &= pc.equal(pc.bit_wise_and(ds.field("qc_flags"), pa.scalar(flag_mask, pa.uint16())), 0)
         scan_columns = None
         if columns is not None:
-            virtual = {"trajectory_id", "source_corr", "target_corr", "canonical_source_window", "qc_release_id", "source_interpolated", "target_interpolated"}
-            missing = set(columns) - self._link_fields - virtual
+            missing = set(columns) - self._link_fields - {"trajectory_id", "period"}
             if missing:
                 raise ValueError(f"Unavailable columns: {sorted(missing)}")
-            needed = set(columns) & self._link_fields
-            if "trajectory_id" in columns:
-                needed.add(id_field)
-            for prefix in ("source", "target"):
-                if f"{prefix}_interpolated" in columns and f"{prefix}_position_type" in self._link_fields:
-                    needed.add(f"{prefix}_position_type")
             # Keep ordering independent of output projection.
-            needed |= {id_field, "start_time_utc", "source_image_id"}
-            needed |= self._link_fields & {"canonical_source_window", "source_rowid"}
+            needed = set(columns) & self._link_fields
+            needed |= {"qc_trajectory_id", "trajectory_link_index", "start_time_utc", "source_image_id", "source_rowid"}
             scan_columns = sorted(needed)
-        scanner = self._arrow.scanner(filter=expression, columns=scan_columns, batch_size=100_000)
-        if max_rows is None:
-            frame = scanner.to_table().to_pandas()
-        else:
-            frame = scanner.head(max_rows).to_pandas()
-        if id_field in frame:
-            frame["trajectory_id"] = frame[id_field].astype("int64")
-        for name in ("source_image_id", "target_image_id"):
-            if name in frame:
-                frame[name] = frame[name].astype("Int64")
-        for prefix in ("source", "target"):
-            corr = f"{prefix}_corr"
-            if corr not in frame:
-                frame[corr] = np.nan
-            interp, position = f"{prefix}_interpolated", f"{prefix}_position_type"
-            if interp not in frame and position in frame:
-                if not frame[position].isin(["observed", "interpolated"]).all():
-                    raise ValueError(f"Unknown {position}")
-                frame[interp] = frame[position].eq("interpolated").astype("int8")
-        for field in ("canonical_source_window", "qc_release_id"):
-            if field not in frame and field in self.metadata:
-                frame[field] = self.metadata[field]
-        if "canonical_source_window" in frame and frame.canonical_source_window.nunique(dropna=False) > 1:
-            raise ValueError("Expected one source window per dataset; select periods independently")
-        for field in ("start_time_utc", "end_time_utc"):
-            if field in frame:
-                frame[field] = pd.to_datetime(frame[field], utc=True, errors="raise").astype("datetime64[ns, UTC]")
-        return frame
+        scanner = self._links.scanner(filter=expression, columns=scan_columns, batch_size=100_000)
+        frame = scanner.to_table().to_pandas() if max_rows is None else scanner.head(max_rows).to_pandas()
+        frame["trajectory_id"] = frame.qc_trajectory_id.astype("int64")
+        frame["period"] = self.metadata["period"]
+        return _link_types(frame)
 
     def _endpoints(self, links):
         frames = []
         for prefix, endpoint, time in (("source", "0", "start_time_utc"), ("target", "1", "end_time_utc")):
             mapping = {f"{prefix}_image_id": "image_id", time: "time_utc", f"x{endpoint}_m": "x_m", f"y{endpoint}_m": "y_m"}
-            for name in ("corr", "interpolated", "orbit_num", "is_last", "stopped", "converged_to"):
+            for name in ENDPOINT_FIELDS:
                 mapping[f"{prefix}_{name}"] = name
             mapping[f"{prefix}_rowid"] = "point_rowid"
-            shared = [field for field in ("trajectory_id", "qc_trajectory_id", "original_trajectory_id", "canonical_source_window", "qc_release_id") if field in links]
+            shared = [field for field in ("trajectory_id", "qc_trajectory_id", "original_trajectory_id", "period") if field in links]
             fields = [field for field in mapping if field in links]
             frames.append(links[shared + fields].rename(columns=mapping))
         frame = pd.concat(frames, ignore_index=True)
         for name in ("image_id", "point_rowid"):
             if name in frame:
                 frame[name] = frame[name].astype("Int64")
-        keys = [key for key in ("canonical_source_window", "trajectory_id") if key in frame]
+        keys = [key for key in ("period", "trajectory_id") if key in frame]
         keys += ["point_rowid"] if "point_rowid" in frame else ["image_id", "time_utc"]
         # An internal point occurs once as a target and once as a source.
-        state = [field for field in ("image_id", "time_utc", "x_m", "y_m", "corr", "interpolated", "is_last", "orbit_num", "stopped", "converged_to") if field in frame and field not in keys]
+        state = [field for field in ("image_id", "time_utc", "x_m", "y_m", *ENDPOINT_FIELDS) if field in frame and field not in keys]
         if frame.drop_duplicates(keys + state).duplicated(keys).any():
             raise ValueError("Displacement endpoints disagree about a shared observation")
         return frame.drop_duplicates(keys).copy()
 
-    def read_displacements(self, *, start=None, stop=None, trajectory_ids=None, columns=None, owned_only=False, max_rows=None):
+    def _owned(self, start, stop):
+        ownership = self.metadata.get("ownership")
+        if not ownership:
+            raise ValueError("Source has no release ownership interval")
+        owner_start, owner_stop = _bounds(ownership["start"], ownership["stop_exclusive"])
+        start = max(start, owner_start) if start is not None else owner_start
+        stop = min(stop, owner_stop) if stop is not None else owner_stop
+        # An empty overlap still produces a typed result through the read path.
+        return min(start, stop), stop
+
+    def read_displacements(self, *, start=None, stop=None, trajectory_ids=None, columns=None, owned_only=False, exclude_flags=(), max_rows=None):
         """Read consecutive links, filtered by their start time after pairing.
 
         QC boundaries are preserved. No correlation, speed or interpolation
         threshold is applied. Non-positive elapsed times yield missing speed.
+        ``exclude_flags`` names QC v1 flags (e.g. ``"LOW_PAIR_DIRECT_SHARE"``)
+        whose links are dropped; by default every kept link is returned.
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)
+        if isinstance(exclude_flags, str):
+            exclude_flags = (exclude_flags,)
+        unknown = set(exclude_flags) - set(QC_FLAG_BITS)
+        if unknown:
+            raise ValueError(f"Unknown QC flags: {sorted(unknown)}; expected {sorted(QC_FLAG_BITS)}")
+        if exclude_flags and self._links is None:
+            raise ValueError("QC flags are stored only in the QC v1 link Parquet")
         if owned_only:
-            ownership = self.metadata.get("canonical_ownership")
-            if not ownership:
-                raise ValueError("Source has no recorded canonical ownership interval")
-            owner_start, owner_stop = _bounds(ownership["start"], ownership["stop_exclusive"])
-            start = max(start, owner_start) if start is not None else owner_start
-            stop = min(stop, owner_stop) if stop is not None else owner_stop
-            if start >= stop:
-                # Produce an empty, typed result through the normal read path.
-                start = stop
-        if self._arrow is not None:
-            frame = self._read_parquet(start, stop, trajectory_ids, columns=columns, max_rows=max_rows)
+            start, stop = self._owned(start, stop)
+        if self._links is not None:
+            flag_mask = sum(1 << QC_FLAG_BITS[name] for name in set(exclude_flags))
+            frame = self._read_parquet(start, stop, trajectory_ids, columns=columns, max_rows=max_rows, flag_mask=flag_mask)
         else:
             ids = trajectory_ids
             if self.kind == "sqlite_points" and ids is None and (start is not None or stop is not None):
@@ -430,24 +449,80 @@ class LimosatDataset:
             points = self.read_points(trajectory_ids=ids)
             frame = self._pair_points(points)
             frame = frame.loc[_time_mask(frame.start_time_utc, start, stop)].copy()
-        metadata = {**self.metadata, "ownership_applied": owned_only, "time_filter": "displacement start time"}
+        metadata = {**self.metadata, "ownership_applied": owned_only, "excluded_flags": sorted(set(exclude_flags)), "time_filter": "displacement start time"}
+        return _finish(frame, columns, metadata, max_rows)
+
+    def read_removed_links(self, *, start=None, stop=None, original_trajectory_ids=None, columns=None, owned_only=False, max_rows=None):
+        """Read links removed by QC v1, with ``qc_exclusion`` and diagnostics.
+
+        Removed links have no QC trajectory; select them by original ID. The
+        QC SQLite stores them in ``qc_removed_links``; link Parquet reads the
+        ``<period>_qc_removed.parquet`` file beside it.
+        """
+        start, stop = _bounds(start, stop)
+        _limit(max_rows)
+        if not self.metadata["qc_protocol_id"]:
+            raise ValueError("Removed links are available only from LiMOSAT QC v1 outputs")
+        if owned_only:
+            start, stop = self._owned(start, stop)
+        if self._links is not None:
+            path = self.path.with_name(self.path.stem + "_removed.parquet")
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            fields = set(pq.ParquetFile(path).schema_arrow.names)
+            if not set(QC_REMOVED_COLUMNS) <= fields:
+                raise ValueError("Expected the LiMOSAT QC v1 removed-link schema")
+            expression = _time_expression("start_time_utc", start, stop)
+            if original_trajectory_ids is not None:
+                expression &= ds.field("original_trajectory_id").isin([int(value) for value in original_trajectory_ids])
+            scan_columns = None
+            if columns is not None:
+                missing = set(columns) - fields - {"period"}
+                if missing:
+                    raise ValueError(f"Unavailable columns: {sorted(missing)}")
+                scan_columns = sorted(set(columns) & fields | {"original_trajectory_id", "trajectory_link_index", "start_time_utc", "source_image_id", "source_rowid"})
+            scanner = ds.dataset(path, format="parquet").scanner(filter=expression, columns=scan_columns, batch_size=100_000)
+            frame = scanner.to_table().to_pandas() if max_rows is None else scanner.head(max_rows).to_pandas()
+        else:
+            where, params = [], []
+            # Stored as 'YYYY-MM-DD HH:MM:SS[.ffffff]+00:00' text. Whole-second
+            # bounds select a superset, refined exactly after parsing.
+            if start is not None:
+                where.append("start_time_utc >= ?")
+                params.append(start.floor("s").strftime("%Y-%m-%d %H:%M:%S"))
+            if stop is not None:
+                where.append("start_time_utc < ?")
+                params.append(stop.ceil("s").strftime("%Y-%m-%d %H:%M:%S"))
+            if original_trajectory_ids is not None:
+                where.append("original_trajectory_id IN (SELECT CAST(value AS INTEGER) FROM json_each(?))")
+                params.append(json.dumps([int(value) for value in original_trajectory_ids]))
+            query = "SELECT * FROM qc_removed_links" + (" WHERE " + " AND ".join(where) if where else "")
+            if max_rows is not None:
+                query += " LIMIT ?"
+                params.append(max_rows)
+            with _connect(self.path) as conn:
+                frame = pd.read_sql_query(query, conn, params=params)
+        frame["period"] = self.metadata["period"]
+        frame = _link_types(frame)
+        frame = frame.loc[_time_mask(frame.start_time_utc, start, stop)].copy()
+        metadata = {**self.metadata, "ownership_applied": owned_only, "time_filter": "displacement start time", "link_coverage": "links removed by QC"}
         return _finish(frame, columns, metadata, max_rows)
 
     def _pair_points(self, points):
-        keys = ["canonical_source_window", "trajectory_id"]
+        keys = ["period", "trajectory_id"]
         following = points.groupby(keys, sort=False).shift(-1)
         keep = following.time_utc.notna()
         if "is_last" in points:
             keep &= points.is_last.eq(0)
         source, target = points.loc[keep], following.loc[keep]
-        shared = [field for field in ("canonical_source_window", "trajectory_id", "qc_trajectory_id", "original_trajectory_id") if field in points]
+        shared = [field for field in ("period", "trajectory_id", "qc_trajectory_id", "original_trajectory_id") if field in points]
         frame = source[shared].copy()
         for prefix, endpoint, time in (("source", "0", "start_time_utc"), ("target", "1", "end_time_utc")):
             values = source if prefix == "source" else target
             frame[f"{prefix}_image_id"] = values.image_id.astype("Int64")
             frame[time] = values.time_utc
             frame[f"x{endpoint}_m"], frame[f"y{endpoint}_m"] = values.x_m, values.y_m
-            for field in ("corr", "interpolated", "orbit_num", "is_last", "stopped", "converged_to"):
+            for field in ENDPOINT_FIELDS:
                 if field in values:
                     frame[f"{prefix}_{field}"] = values[field]
             if "point_rowid" in values:
@@ -457,8 +532,7 @@ class LimosatDataset:
         frame["dx_m"] = frame.x1_m - frame.x0_m
         frame["dy_m"] = frame.y1_m - frame.y0_m
         frame["distance_m"] = np.hypot(frame.dx_m, frame.dy_m)
-        frame["speed_m_s"] = frame.distance_m / frame.elapsed_seconds.where(frame.positive_elapsed)
-        frame["speed_m_per_day"] = frame.speed_m_s * 86_400
+        frame["speed_m_per_day"] = frame.distance_m / frame.elapsed_seconds.where(frame.positive_elapsed) * 86_400
         return frame
 
     def read_trajectories_through(self, *, start, stop, xlim, ylim, linked_only=False):
