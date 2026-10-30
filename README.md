@@ -60,8 +60,10 @@ linked_points = data.read_points(start="2024-01-01", stop="2024-01-04")
 
 `read_points()` returns only observations of trajectories with at least two
 points, from every input. Single-point trajectories carry no displacement. In
-QC v1 they are points whose every link was removed: 884,092 of 2,059,017 QC
-trajectories (14% of observations) in 202305_202407. The QC SQLite keeps them;
+QC v1 they are mostly points whose every link was removed, plus points that
+were never linked (none in 2022-25): 13.8 M of 36.5 M QC trajectories across
+the ten periods, 4.4% of observations (14% in 202305_202407). The QC SQLite
+keeps them;
 `include_singletons=True` returns them from SQLite or Feather. Link Parquet
 cannot provide them. With the default, both QC v1 files give the same
 observations.

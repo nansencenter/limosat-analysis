@@ -21,7 +21,7 @@ BIG_ID = 2**53 + 3
 # trajectory, QC is_last, original trajectory). Original trajectory 10 is split
 # by a removed link into QC trajectories 10 and 11; the only link of 13 is
 # removed, leaving single-point trajectories 13 and 14. Raw singleton 12, in no
-# link, does not occur in the release but tests missing original IDs.
+# link, occurs in the 2015-22 periods and has no original ID.
 POINTS = [
     (1, BIG_ID, "2023-07-29 00:00:00", 0, 0, .9, 0, 10, 0, 10),
     (2, BIG_ID + 1, "2023-07-30 00:00:00", 3, 4, .8, 1, 10, 0, 10),
