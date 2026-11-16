@@ -92,10 +92,18 @@ def removed_frame():
     return frame
 
 
-def write_kept(path, frame, protocol_id=PROTOCOL):
+BASE_FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1}
+FALSE_LAND_AMENDMENT = {"id": "mask_false_land_20261102", "flag": "MASK_FALSE_LAND", "bit": 2}
+
+
+def write_kept(path, frame, protocol_id=PROTOCOL, amendments=(FALSE_LAND_AMENDMENT,)):
+    """Write kept links as the 2 Nov 2026 release does: the protocol's flag bits
+    stay in ``limosat.qc`` and later flags are listed as amendments."""
     table = pa.Table.from_pandas(frame, preserve_index=False)
-    table = table.replace_schema_metadata({b"limosat.qc": json.dumps({"protocol_id": protocol_id, "flag_bits": QC_FLAG_BITS}).encode()})
-    pq.write_table(table, path)
+    metadata = {b"limosat.qc": json.dumps({"protocol_id": protocol_id, "flag_bits": BASE_FLAG_BITS}).encode()}
+    if amendments:
+        metadata[b"limosat.qc.amendments"] = json.dumps(list(amendments)).encode()
+    pq.write_table(table.replace_schema_metadata(metadata), path)
 
 
 def manifest(**changes):
@@ -249,6 +257,43 @@ def test_exclude_flags_is_opt_in(parquet, qc):
         data.read_displacements(exclude_flags=["PAIR_INCOHERENT"])
     with pytest.raises(ValueError, match="only in the QC v1 link Parquet"):
         open_limosat(qc).read_displacements(exclude_flags=["LOW_PAIR_DIRECT_SHARE"])
+
+
+def flagged_frame(flags):
+    frame = kept_frame()
+    frame["qc_flags"] = np.array(flags, dtype="uint16")
+    frame["qc_flag_reasons"] = [";".join(name for name, bit in QC_FLAG_BITS.items() if value >> bit & 1) for value in flags]
+    return frame
+
+
+def test_mask_false_land_flag_can_be_excluded(parquet):
+    # Bit 2 is MASK_FALSE_LAND; 6 carries it together with LOW_PAIR_DIRECT_SHARE.
+    write_kept(parquet, flagged_frame([0, 4, 6]))
+    data = open_limosat(parquet)
+    assert QC_FLAG_BITS["MASK_FALSE_LAND"] == 2
+    assert data.metadata["qc_flag_bits"]["MASK_FALSE_LAND"] == 2
+    assert data.read_displacements().qc_flags.tolist() == [0, 4, 6]
+    kept = data.read_displacements(exclude_flags="MASK_FALSE_LAND", columns=["qc_flags"])
+    assert kept.qc_flags.tolist() == [0] and kept.attrs["excluded_flags"] == ["MASK_FALSE_LAND"]
+    both = data.read_displacements(exclude_flags=["MASK_FALSE_LAND", "LOW_PAIR_DIRECT_SHARE"], columns=["qc_flags"])
+    assert both.qc_flags.tolist() == [0]
+
+
+def test_release_without_false_land_amendment_still_opens(parquet):
+    write_kept(parquet, kept_frame(), amendments=())
+    data = open_limosat(parquet)
+    assert "MASK_FALSE_LAND" not in data.metadata["qc_flag_bits"]
+    assert len(data.read_displacements(exclude_flags="MASK_FALSE_LAND")) == 3
+
+
+@pytest.mark.parametrize("amendment", [
+    {"flag": "MASK_FALSE_LAND", "bit": 3},
+    {"flag": "PAIR_INCOHERENT", "bit": 5},
+])
+def test_unknown_or_changed_amended_flags_are_rejected(parquet, amendment):
+    write_kept(parquet, kept_frame(), amendments=(amendment,))
+    with pytest.raises(ValueError, match="unknown or changed flags"):
+        open_limosat(parquet)
 
 
 @pytest.mark.parametrize("source", ["qc", "parquet"])

@@ -32,7 +32,7 @@ QC_LINK_COLUMNS = QC_BASE_COLUMNS + [
 ]
 QC_REMOVED_COLUMNS = QC_BASE_COLUMNS + ["qc_exclusion"]
 QC_PROTOCOLS = {"limosat_qc_v1_draft_20261028": "e91d7a9c8e9588650f90125ea804d4d04aae629dca422aceec6efb878394fff3"}
-QC_FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1}
+QC_FLAG_BITS = {"FEW_NEIGHBOURS": 0, "LOW_PAIR_DIRECT_SHARE": 1, "MASK_FALSE_LAND": 2}
 QC_CRS = "EPSG:3413"
 # Release date ownership of link start times, half-open. Matches the
 # canonical_ownership intervals of the ten-period displacement package.
@@ -243,9 +243,21 @@ class LimosatDataset:
         if not sidecar.is_file():
             raise ValueError(f"QC v1 Parquet requires its manifest: {sidecar.name}")
         self.metadata.update(_qc_metadata(json.loads(sidecar.read_text())))
-        arrow = json.loads((schema.metadata or {}).get(b"limosat.qc", b"{}"))
-        if arrow.get("protocol_id") != self.metadata["qc_protocol_id"] or arrow.get("flag_bits") != QC_FLAG_BITS:
-            raise ValueError("Parquet limosat.qc metadata disagrees with the manifest protocol or flag bits")
+        file_metadata = schema.metadata or {}
+        arrow = json.loads(file_metadata.get(b"limosat.qc", b"{}"))
+        # Flags added after the protocol was frozen (e.g. MASK_FALSE_LAND, bit 2)
+        # are listed as amendments instead of in the protocol's flag_bits.
+        declared = dict(arrow.get("flag_bits") or {})
+        for amendment in json.loads(file_metadata.get(b"limosat.qc.amendments", b"[]")):
+            if "flag" in amendment and "bit" in amendment:
+                declared[amendment["flag"]] = amendment["bit"]
+        conflicting = {name: bit for name, bit in declared.items() if QC_FLAG_BITS.get(name) != bit}
+        if arrow.get("protocol_id") != self.metadata["qc_protocol_id"] or not arrow.get("flag_bits") or conflicting:
+            raise ValueError(
+                "Parquet limosat.qc metadata disagrees with the manifest protocol or flag bits"
+                + (f" (unknown or changed flags: {conflicting})" if conflicting else "")
+            )
+        self.metadata["qc_flag_bits"] = {name: bit for name, bit in QC_FLAG_BITS.items() if name in declared}
         self.kind = "parquet_qc_links"
         self._links = ds.dataset(self.path, format="parquet")
         self._link_fields = fields
@@ -434,8 +446,11 @@ class LimosatDataset:
 
         QC boundaries are preserved. No correlation, speed or interpolation
         threshold is applied. Non-positive elapsed times yield missing speed.
-        ``exclude_flags`` names QC v1 flags (e.g. ``"LOW_PAIR_DIRECT_SHARE"``)
-        whose links are dropped; by default every kept link is returned.
+        ``exclude_flags`` names QC v1 flags (``"FEW_NEIGHBOURS"``,
+        ``"LOW_PAIR_DIRECT_SHARE"``, ``"MASK_FALSE_LAND"``) whose links are
+        dropped; by default every kept link is returned. A flag the file does
+        not declare (``MASK_FALSE_LAND`` in a release before the 2 November 2026
+        amendment) drops nothing.
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)

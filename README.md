@@ -95,8 +95,9 @@ Kept-link Parquet also returns `trajectory_link_index`, `qc_segment`, both
 endpoints' `interpolated`, `corr`, `orbit_num`, `is_last`, `stopped` and
 `converged_to`, `qc_flags`, `qc_flag_reasons`, `pair_direct_share`,
 `qc_sic_start`, `qc_sic_end` and `qc_neighbours_30km`. `qc_flags` bits are
-`FEW_NEIGHBOURS` (0) and `LOW_PAIR_DIRECT_SHARE` (1); flags never split
-trajectories. Links derived from SQLite carry the endpoint state but no flags.
+`FEW_NEIGHBOURS` (0), `LOW_PAIR_DIRECT_SHARE` (1) and `MASK_FALSE_LAND` (2);
+flags never split trajectories. Links derived from SQLite carry the endpoint
+state but no flags.
 Endpoint `is_last` in the link Parquet is the original (pre-QC) trajectory's
 flag, so a QC trajectory ending at a removed link has `target_is_last == 0`. In
 the QC SQLite, `is_last` marks the end of each QC trajectory, and so do the
@@ -117,7 +118,13 @@ removed.qc_exclusion.value_counts()
 
 `LOW_PAIR_DIRECT_SHARE` marks image pairs with less than 40% direct matches,
 where kept interpolated links are more often wrong. Filter on
-`pair_direct_share` directly for other thresholds. Removed links have no QC
+`pair_direct_share` directly for other thresholds. `MASK_FALSE_LAND`, added to
+the 29 October 2026 release on 2 November 2026, is informational: it marks links
+with an end in false land of their own Sentinel-1 scene (scenes spanning 180°,
+mostly East Siberian, Chukchi and Bering seas), where the preprocessing land mask
+had false land strips over sea ice and trajectories were carried by
+interpolation. Releases made before the amendment do not carry the flag, and
+excluding it from them drops nothing. Removed links have no QC
 trajectory; select them with `original_trajectory_ids=`. From SQLite they are
 read from `qc_removed_links`, and from Parquet from
 `<period>_qc_removed.parquet`. `qc_exclusion` holds one step code (`SPEED`,
