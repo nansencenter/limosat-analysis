@@ -21,7 +21,7 @@ def scene(n):
     return f"S1A_EW_GRDM_1SDH_SCENE{n:02d}"
 
 
-# trajectory, point_index, time, scene, x, y, dx, dy, speed, interpolated, correlation, share, flags, is_primary
+# trajectory, point_index, time, scene, x, y, dx, dy, speed, interpolated, correlation, share, quality_flags, is_primary
 ROWS = [
     (10, 0, "2023-07-30T00:00:00", 1, 0.0, 0.0, None, None, None, None, None, None, None, False),
     (10, 1, "2023-07-31T12:00:00", 2, 100.0, 0.0, 100.0, 0.0, 100 / 1.5, False, 0.5, 0.9, 0, False),
@@ -34,13 +34,13 @@ ROWS = [
     (12, 1, "2024-01-03T00:00:00", 8, 25.0, 5.0, 20.0, 0.0, 10.0, False, 0.9, 0.5, 0, True),
 ]
 COLUMNS = ["trajectory_id", "point_index", "time", "scene", "x_m", "y_m", "dx_m", "dy_m", "speed_m_per_day",
-           "interpolated", "correlation", "direct_match_share", "flags", "is_primary"]
+           "interpolated", "correlation", "direct_match_share", "quality_flags", "is_primary"]
 
 
 def write_points(path, version="2.0.0", rows=ROWS):
     kinds = {"period": pa.string(), "trajectory_id": pa.int64(), "point_index": pa.int32(), "time": pa.timestamp("ms", tz="UTC"),
              "scene": pa.string(), "interpolated": pa.bool_(), "correlation": pa.float32(),
-             "direct_match_share": pa.float32(), "flags": pa.uint8(), "is_primary": pa.bool_()}
+             "direct_match_share": pa.float32(), "quality_flags": pa.uint8(), "is_primary": pa.bool_()}
     names = ["period"] + COLUMNS
     data = {name: [] for name in names}
     for row in rows:
@@ -76,7 +76,7 @@ def test_open_dispatches_to_the_trajectory_reader_and_reads_the_file_metadata(po
     assert data.metadata["flag_bits"] == FLAG_BITS and data.metadata["rows"] == 9
     assert data.metadata["primary_window"]["stop_exclusive"] == "2024-08-01T00:00:00Z"
     description = data.describe().set_index("column")
-    assert description.loc["x_m", "unit"] == "m" and description.loc["flags", "description"] == "flags text"
+    assert description.loc["x_m", "unit"] == "m" and description.loc["quality_flags", "description"] == "quality_flags text"
 
 
 def test_read_points_filters_and_sorts_by_time(points):
@@ -123,7 +123,7 @@ def test_read_displacements_pairs_consecutive_observations(points):
     assert row.start_time == pd.Timestamp("2023-07-31T12:00:00", tz="UTC")
     assert row.end_time == pd.Timestamp("2023-08-02", tz="UTC")
     assert (row.start_scene, row.end_scene) == (scene(2), scene(3))
-    assert row["flags"] == 2 and bool(row.interpolated) is True and not row.is_primary and row.period == PERIOD
+    assert row["quality_flags"] == 2 and bool(row.interpolated) is True and not row.is_primary and row.period == PERIOD
     assert str(frame["start_time"].dtype) == "datetime64[ns, UTC]"
     # the window is on the displacement's start time: the one that starts before it is excluded
     window = data.read_displacements(start="2023-08-01", stop="2023-08-05")
@@ -135,10 +135,10 @@ def test_read_displacements_pairs_consecutive_observations(points):
 def test_read_displacements_can_drop_flagged_displacements(points):
     data = open_limosat(points)
     false_land = data.read_displacements(exclude_flags="MASK_FALSE_LAND")
-    assert len(false_land) == 5 and (4 not in false_land["flags"].tolist())
+    assert len(false_land) == 5 and (4 not in false_land["quality_flags"].tolist())
     assert false_land.attrs["excluded_flags"] == ["MASK_FALSE_LAND"]
     both = data.read_displacements(exclude_flags=["LOW_PAIR_DIRECT_SHARE", "MASK_FALSE_LAND"])
-    assert both["flags"].tolist() == [0, 1, 0, 0]  # only FEW_NEIGHBOURS (bit 0) is left
+    assert both["quality_flags"].tolist() == [0, 1, 0, 0]  # only FEW_NEIGHBOURS (bit 0) is left
     assert len(data.read_displacements(start="2023-08-01", stop="2023-08-05", exclude_flags="MASK_FALSE_LAND")) == 0
     with pytest.raises(ValueError, match="Unknown flags"):
         data.read_displacements(exclude_flags=["PAIR_INCOHERENT"])

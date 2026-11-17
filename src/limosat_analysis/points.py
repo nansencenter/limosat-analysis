@@ -3,7 +3,7 @@
 A row is one observation of a feature in one Sentinel-1 scene. The rows of a trajectory share
 ``trajectory_id`` and are ordered by ``point_index`` (0 at the first observation). Every row after the first
 also describes the displacement from the previous observation (``dx_m``, ``dy_m``, ``speed_m_per_day``,
-``interpolated``, ``correlation``, ``direct_match_share``, ``flags``). ``is_primary`` marks the rows in the
+``interpolated``, ``correlation``, ``direct_match_share``, ``quality_flags``). ``is_primary`` marks the rows in the
 period's own date window; selecting those rows from all periods covers each date once.
 
 Everything the reader needs (schema version, flag names, window, CRS, column descriptions) is read from the
@@ -27,7 +27,7 @@ from .reader import _bounds, _limit, _time_expression
 SUPPORTED_MAJOR_VERSION = 2
 REQUIRED_COLUMNS = ("trajectory_id", "point_index", "time", "x_m", "y_m")
 DISPLACEMENT_COLUMNS = (
-    "dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "flags",
+    "dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "quality_flags",
 )
 NULLABLE_TYPES = {pa.bool_(): pd.BooleanDtype(), pa.uint8(): pd.UInt8Dtype()}.get
 
@@ -228,7 +228,7 @@ class LimosatTrajectories:
             keep &= frame["is_primary"].fillna(False).astype(bool)
         if exclude_flags:
             mask = sum(1 << bits[name] for name in set(exclude_flags))
-            keep &= (frame["flags"].fillna(0).astype("int64") & mask) == 0
+            keep &= (frame["quality_flags"].fillna(0).astype("int64") & mask) == 0
         frame = frame[keep].sort_values(["start_time", "trajectory_id", "point_index"], kind="stable")
         if exclude_flags:
             frame.attrs["excluded_flags"] = sorted(set(exclude_flags))

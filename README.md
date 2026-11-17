@@ -47,7 +47,7 @@ them. A row is one observation of a feature in one Sentinel-1 scene. The rows
 of a trajectory share `trajectory_id` and are ordered by `point_index`; every
 row after the first also carries the displacement from the previous
 observation (`dx_m`, `dy_m`, `speed_m_per_day`, `interpolated`, `correlation`,
-`direct_match_share`, `flags`). Trajectory identifiers are unique only within a
+`direct_match_share`, `quality_flags`). Trajectory identifiers are unique only within a
 period. Periods overlap by three months; `is_primary` marks the rows in the
 period's own window, and keeping `is_primary` rows from all periods covers each
 date once.
@@ -76,9 +76,7 @@ moves = data.read_displacements(start="2024-01-01", stop="2024-02-01",
 `start`/`stop` are UTC and half-open. For `read_points` and `read_trajectories`
 they select observation times; for `read_displacements` they select the time
 the displacement starts, which is also what `is_primary` is defined on. The
-flag names come from the file (`data.metadata["flag_bits"]`). Read the
-`flags` column with `frame["flags"]`: `frame.flags` is a pandas attribute, not
-the column.
+flag names come from the file (`data.metadata["flag_bits"]`).
 
 ## Reader usage
 
