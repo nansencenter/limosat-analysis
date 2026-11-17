@@ -22,7 +22,6 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
-from .reader import _bounds, _limit, _time_expression
 
 SUPPORTED_MAJOR_VERSION = 2
 REQUIRED_COLUMNS = ("trajectory_id", "point_index", "time", "x_m", "y_m")
@@ -30,6 +29,36 @@ DISPLACEMENT_COLUMNS = (
     "dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "quality_flags",
 )
 NULLABLE_TYPES = {pa.bool_(): pd.BooleanDtype(), pa.uint8(): pd.UInt8Dtype()}.get
+
+
+def _utc(value):
+    if value is None:
+        return None
+    timestamp = pd.Timestamp(value)
+    if pd.isna(timestamp):
+        raise ValueError("Time bounds must not be NaT")
+    return timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
+
+
+def _bounds(start, stop):
+    start, stop = _utc(start), _utc(stop)
+    if start is not None and stop is not None and start >= stop:
+        raise ValueError("Expected start < stop (stop is exclusive)")
+    return start, stop
+
+
+def _limit(max_rows):
+    if max_rows is not None and (isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1):
+        raise ValueError("max_rows must be a positive integer")
+
+
+def _time_expression(field, start, stop):
+    expression = ds.scalar(True)
+    if start is not None:
+        expression &= ds.field(field) >= pa.scalar(start, type=pa.timestamp("ns", tz="UTC"))
+    if stop is not None:
+        expression &= ds.field(field) < pa.scalar(stop, type=pa.timestamp("ns", tz="UTC"))
+    return expression
 
 
 def is_point_file(path) -> bool:
@@ -182,7 +211,8 @@ class LimosatTrajectories:
 
         ``start <= start_time < stop`` selects by the time the displacement starts, which is also what
         ``is_primary`` is defined on. Columns: ``trajectory_id``, ``point_index`` (of the end observation),
-        ``start_time``, ``end_time``, ``x0_m``, ``y0_m``, ``x1_m``, ``y1_m``, the displacement columns,
+        ``start_time``, ``end_time``, ``elapsed_seconds`` (derived from the two times), ``x0_m``, ``y0_m``, ``x1_m``,
+        ``y1_m``, the displacement columns,
         ``start_scene``/``end_scene``, ``is_primary`` and ``period`` where the file has them.
         ``exclude_flags`` names flags (see ``metadata['flag_bits']``) whose displacements are dropped; by
         default every displacement is returned.
@@ -208,6 +238,7 @@ class LimosatTrajectories:
         end, before = rows[has_previous], previous[has_previous]
         frame = pd.DataFrame({"trajectory_id": end["trajectory_id"], "point_index": end["point_index"],
                               "start_time": before["time"], "end_time": end["time"],
+                              "elapsed_seconds": (end["time"] - before["time"]).dt.total_seconds(),
                               "x0_m": before["x_m"], "y0_m": before["y_m"], "x1_m": end["x_m"], "y1_m": end["y_m"]})
         for name in DISPLACEMENT_COLUMNS:
             if name in end:
@@ -230,8 +261,7 @@ class LimosatTrajectories:
             mask = sum(1 << bits[name] for name in set(exclude_flags))
             keep &= (frame["quality_flags"].fillna(0).astype("int64") & mask) == 0
         frame = frame[keep].sort_values(["start_time", "trajectory_id", "point_index"], kind="stable")
-        if exclude_flags:
-            frame.attrs["excluded_flags"] = sorted(set(exclude_flags))
+        frame.attrs["excluded_flags"] = sorted(set(exclude_flags))
         if max_rows is not None:
             frame = frame.iloc[:max_rows]
         if columns is not None:
@@ -256,3 +286,19 @@ class LimosatTrajectories:
         if digest.hexdigest() != entries[0]["sha256"]:
             raise ValueError(f"{self.path.name}: checksum differs from manifest.json")
         return True
+
+
+def open_limosat(path) -> LimosatTrajectories:
+    """Open one period file of the public LiMOSAT trajectory release (``limosat_<period>.parquet``)."""
+    path = Path(path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.is_dir():
+        raise ValueError("Open one period file, limosat_<period>.parquet; periods are not combined automatically")
+    if not is_point_file(path):
+        raise ValueError(
+            f"{path.name} is not a LiMOSAT trajectory file (Parquet with limosat.schema_version metadata). "
+            "Raw tracking databases, the earlier benchmark Feather files and the internal QC v1 archive are not read "
+            "by this version; use limosat-analysis commit 6d3694b for them (pandas.read_feather reads the Feather files)."
+        )
+    return LimosatTrajectories(path)

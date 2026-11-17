@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -125,6 +126,7 @@ def test_read_displacements_pairs_consecutive_observations(points):
     assert (row.start_scene, row.end_scene) == (scene(2), scene(3))
     assert row["quality_flags"] == 2 and bool(row.interpolated) is True and not row.is_primary and row.period == PERIOD
     assert str(frame["start_time"].dtype) == "datetime64[ns, UTC]"
+    assert row["elapsed_seconds"] == 129_600.0 and frame.attrs["excluded_flags"] == []
     # the window is on the displacement's start time: the one that starts before it is excluded
     window = data.read_displacements(start="2023-08-01", stop="2023-08-05")
     assert window[["trajectory_id", "point_index"]].values.tolist() == [[10, 3]]
@@ -174,3 +176,20 @@ def test_verify_checks_the_manifest_checksum(points):
     manifest.unlink()
     with pytest.raises(FileNotFoundError):
         open_limosat(points).verify()
+
+
+def test_open_rejects_everything_that_is_not_a_trajectory_file(tmp_path, points):
+    with pytest.raises(FileNotFoundError):
+        open_limosat(tmp_path / "missing.parquet")
+    with pytest.raises(ValueError, match="one period file"):
+        open_limosat(tmp_path)
+    feather = tmp_path / "benchmark.feather"
+    pd.DataFrame({"i": [1], "g": [1]}).to_feather(feather)
+    plain = tmp_path / "plain.parquet"
+    pq.write_table(pa.table({"a": [1]}), plain)
+    database = tmp_path / "raw.sqlite"
+    sqlite3.connect(database).close()
+    for other in (feather, plain, database):
+        with pytest.raises(ValueError, match="not a LiMOSAT trajectory file"):
+            open_limosat(other)
+    assert isinstance(open_limosat(points), LimosatTrajectories)

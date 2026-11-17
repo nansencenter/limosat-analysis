@@ -1,6 +1,5 @@
-"""Read LiMOSAT observations and consecutive displacements."""
+"""Read the public LiMOSAT trajectory release: one Parquet point table per processing period."""
 
-from .points import LimosatTrajectories
-from .reader import LimosatDataset, open_limosat
+from .points import LimosatTrajectories, open_limosat
 
-__all__ = ["LimosatDataset", "LimosatTrajectories", "open_limosat"]
+__all__ = ["LimosatTrajectories", "open_limosat"]
