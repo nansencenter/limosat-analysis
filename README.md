@@ -29,6 +29,7 @@ files together, as the reader uses the neighbouring files.
 | --- | --- | --- |
 | QC v1 kept-link Parquet (`<period>_qc.parquet`) | Kept links with QC and original trajectory IDs, endpoint state, `qc_flags`, `pair_direct_share`, SIC and neighbour counts | Validates the QC v1 link schema and the `<period>_qc.manifest.json` sidecar (status complete, zero continuity violations, known protocol id and SHA-256, cross-checked with the Arrow `limosat.qc` metadata). Reads links directly; removed links come from `<period>_qc_removed.parquet`. |
 | QC v1 SQLite (`<period>_qc.sqlite`) | Every raw observation in `<period>__qc`, with `trajectory_id` and `is_last` rewritten to QC trajectories; `qc_removed_links`; `qc_metadata` | Selects the QC table and validates `qc_metadata` as above. Excludes descriptors and single-point trajectories (opt in with `include_singletons=True`), decodes POINT WKT and derives links within QC trajectories. Original trajectory IDs come from the kept and removed links by rowid. |
+| Public trajectory Parquet (`limosat_<period>.parquet`, schema 2) | One row per observation of a trajectory, sorted by time, with the Sentinel-1 scene name, the displacement from the previous observation and an `is_primary` flag | Opens as a `LimosatTrajectories`. Everything it needs (schema version, flag names, primary window, CRS, column descriptions) comes from the file's own metadata; no sidecar is required. See [Public trajectory files](#public-trajectory-files-schema-2). |
 | Raw SQLite (`.sqlite`, `.db`) | One raw observation table | Requires an explicit CRS and is labelled as raw data; reading it does not apply QC. Use `table=` to resolve ambiguous tables. |
 | Legacy point Feather (`.feather`) | `i`, `g`, `d`, `x`, `y`, `q`, or a point table with descriptive headings | Renames legacy fields; optional image IDs and correlation can be missing. An explicit CRS is required when absent. |
 
@@ -37,6 +38,47 @@ displacement Parquet, and monthly displacement stores) are no longer read. A cat
 observation SQLite. Choose an individual period file; opening a release or
 period directory is deliberately rejected because combining periods requires an
 explicit ownership policy.
+
+## Public trajectory files (schema 2)
+
+The public release is one Parquet point table per processing period,
+`limosat_<period>.parquet`, with a `manifest.json` and a data dictionary beside
+them. A row is one observation of a feature in one Sentinel-1 scene. The rows
+of a trajectory share `trajectory_id` and are ordered by `point_index`; every
+row after the first also carries the displacement from the previous
+observation (`dx_m`, `dy_m`, `speed_m_per_day`, `interpolated`, `correlation`,
+`direct_match_share`, `flags`). Trajectory identifiers are unique only within a
+period. Periods overlap by three months; `is_primary` marks the rows in the
+period's own window, and keeping `is_primary` rows from all periods covers each
+date once.
+
+```python
+from limosat_analysis import open_limosat
+
+data = open_limosat("limosat_202305_202407.parquet")
+data.metadata            # schema_version, period, crs, flag_bits, primary_window, ...
+data.describe()          # column, type, unit and description, as recorded in the file
+data.verify()            # SHA-256 against manifest.json in the same folder
+
+points = data.read_points(start="2024-01-01", stop="2024-02-01", primary_only=True)
+
+# Complete trajectories that have an observation in a space-time window
+tracks = data.read_trajectories(start="2024-01-01", stop="2024-01-08",
+                                xlim=(-500_000, 500_000), ylim=(-1_000_000, 0))
+for trajectory_id, track in tracks.groupby("trajectory_id"):
+    ...                  # one trajectory at a time, ordered by point_index
+
+# One row per displacement, with both ends; drop displacements by flag name
+moves = data.read_displacements(start="2024-01-01", stop="2024-02-01",
+                                exclude_flags=["MASK_FALSE_LAND"])
+```
+
+`start`/`stop` are UTC and half-open. For `read_points` and `read_trajectories`
+they select observation times; for `read_displacements` they select the time
+the displacement starts, which is also what `is_primary` is defined on. The
+flag names come from the file (`data.metadata["flag_bits"]`). Read the
+`flags` column with `frame["flags"]`: `frame.flags` is a pandas attribute, not
+the column.
 
 ## Reader usage
 

@@ -583,5 +583,13 @@ class LimosatDataset:
 
 
 def open_limosat(path, *, table=None, crs=None):
-    """Inspect a LiMOSAT source without loading its observation/link table."""
+    """Inspect a LiMOSAT source without loading its observation/link table.
+
+    A Parquet file of the public trajectory release (schema 2, one point table per period) opens as a
+    ``LimosatTrajectories``; every other source opens as a ``LimosatDataset``.
+    """
+    from .points import LimosatTrajectories, is_point_file
+
+    if is_point_file(path):
+        return LimosatTrajectories(path)
     return LimosatDataset(path, table=table, crs=crs)
