@@ -6,7 +6,7 @@ trajectories from Sentinel-1, May 2015 to July 2025.
 ## The release
 
 The release is one Parquet file per processing period, `limosat_<period>.parquet`, with a
-`manifest.json`, a data dictionary (`DATA_DICTIONARY.md`) and `checksums.sha256` beside them. The
+`manifest.json` and a `README.md` (the data dictionary, attribution and licence) beside them. The
 files are plain Parquet: any Parquet reader (pandas, DuckDB, R arrow, ...) can read them. This package
 adds trajectory-aware access on top.
 
@@ -28,7 +28,7 @@ Processing periods are 15 months long and overlap their neighbours by three mont
 period are published. `is_primary` marks the rows in a period's own window (1 August to the next 1 August;
 the first period also owns its first three months). Keeping `is_primary` rows from all periods covers each
 date exactly once. `quality_flags` is a bit mask of informational flags that never split trajectories; the
-names and bits are in `data.metadata["flag_bits"]`. See `DATA_DICTIONARY.md` for the full definitions.
+names and bits are in `data.metadata["flag_bits"]`. See the release's `README.md` for the full definitions.
 
 ## Installation
 
