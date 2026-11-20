@@ -232,3 +232,32 @@ def test_open_rejects_everything_that_is_not_a_trajectory_file(tmp_path, path):
         with pytest.raises(ValueError, match="not a LiMOSAT trajectory file"):
             open_limosat(other)
     assert isinstance(open_limosat(path), LimosatTrajectories)
+
+
+def test_windowed_reads_match_a_brute_force_selection_when_the_file_is_read_in_many_runs(tmp_path):
+    rng = np.random.default_rng(3)
+    rows, base = [], t("2023-08-01T00:00:00").timestamp()
+    for traj in range(1, 121):
+        start = base + rng.uniform(0, 200) * 86400
+        n = int(rng.integers(2, 9))
+        for k in range(n):
+            when = datetime.fromtimestamp(start + k * rng.uniform(0.2, 3) * 86400, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            rows.append((traj, k, when, 1, float(rng.normal()), float(rng.normal()), None if k == 0 else 1.0, None if k == 0 else 2.0,
+                         None if k == 0 else 3.0, None if k == 0 else False, None if k == 0 else 0.5, None if k == 0 else 0.5,
+                         None if k == 0 else 0, bool(rng.integers(0, 2))))
+    path = tmp_path / f"limosat_{PERIOD}.nc"
+    write_netcdf(path, rows)
+    data = open_limosat(path)
+    data._gap = 5  # force many separate runs
+    frame = pd.DataFrame(rows, columns=["trajectory_id", "point_index", "time", "scene", "x_m", "y_m", "dx", "dy", "sp", "ip", "c", "s", "q", "is_primary"])
+    frame["time"] = pd.to_datetime(frame["time"], utc=True)
+    for lo, hi, primary in (("2023-09-01", "2023-10-01", False), ("2023-10-15", "2024-01-01", True), ("2023-08-01", "2024-08-01", False)):
+        expect = frame[(frame.time >= lo) & (frame.time < hi) & ((frame.is_primary) if primary else True)]
+        got = data.read_points(start=lo, stop=hi, primary_only=primary)
+        assert len(got) == len(expect) and got["time"].is_monotonic_increasing
+        assert sorted(zip(got.trajectory_id, got.point_index)) == sorted(zip(expect.trajectory_id, expect.point_index))
+        assert np.allclose(np.sort(got.x_m), np.sort(expect.x_m))
+    tracks = data.read_trajectories(start="2023-09-01", stop="2023-09-15")
+    inside = frame[(frame.time >= "2023-09-01") & (frame.time < "2023-09-15")].trajectory_id.unique()
+    assert set(tracks.trajectory_id) == set(inside)
+    assert len(tracks) == int(frame.trajectory_id.isin(inside).sum())

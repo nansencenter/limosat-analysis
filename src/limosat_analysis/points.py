@@ -123,18 +123,14 @@ class LimosatTrajectories:
 
     def _runs(self, selected):
         """Contiguous (first trajectory, last trajectory + 1) groups of the selected trajectory indices, merging small gaps."""
-        if len(selected) == 0:
+        sel = np.asarray(selected, dtype=np.int64)
+        if len(sel) == 0:
             return []
-        t = self._traj()
-        runs, first, last = [], selected[0], selected[0]
-        for i in selected[1:]:
-            if t["offset"][i] - t["offset"][last + 1] <= self._gap:
-                last = i
-            else:
-                runs.append((first, last + 1))
-                first = last = i
-        runs.append((first, last + 1))
-        return runs
+        offset = self._traj()["offset"]
+        breaks = np.flatnonzero(offset[sel[1:]] - offset[sel[:-1] + 1] > self._gap)
+        firsts = np.r_[sel[0], sel[breaks + 1]]
+        lasts = np.r_[sel[breaks], sel[-1]] + 1
+        return list(zip(firsts.tolist(), lasts.tolist()))
 
     def _read(self, selected, names) -> pd.DataFrame:
         """All observations of the trajectories ``selected`` (sorted indices), as a frame with ``trajectory_id`` and ``names``."""
@@ -159,13 +155,55 @@ class LimosatTrajectories:
             out[n] = np.concatenate(parts[n]) if parts[n] else np.array([])
         return self._decode(out)
 
+    def _read_rows(self, selected, names, start=None, stop=None, primary_only=False) -> dict:
+        """Observations of the candidate trajectories ``selected`` that fall in [start, stop), as raw arrays plus ``trajectory_id``.
+
+        ``time`` (and ``is_primary``) are read first for the whole candidate runs; the other variables are then read only for
+        the runs of rows that are wanted, so a window that covers a small part of long trajectories decompresses little.
+        """
+        t = self._traj()
+        selected = np.asarray(selected, dtype=np.int64)
+        names = [n for n in dict.fromkeys(names) if n != "trajectory_id"]
+        wanted = np.zeros(len(t["ids"]), dtype=bool)
+        wanted[selected] = True
+        parts = []
+        with self._dataset() as d:
+            for a, b in self._runs(selected):
+                lo, hi = t["offset"][a], t["offset"][b]
+                keep = np.repeat(wanted[a:b], t["rowsize"][a:b])
+                if start is not None or stop is not None:
+                    tt = d["time"][lo:hi]
+                    if start is not None:
+                        keep &= tt >= start.timestamp()
+                    if stop is not None:
+                        keep &= tt < stop.timestamp()
+                if primary_only:
+                    keep &= d["is_primary"][lo:hi] == 1
+                parts.append(lo + np.flatnonzero(keep))
+            rows = np.concatenate(parts) if parts else np.array([], dtype=np.int64)
+            out = {n: [] for n in names}
+            if len(rows):
+                breaks = np.flatnonzero(np.diff(rows) > self._gap)
+                first = np.r_[0, breaks + 1]
+                last = np.r_[breaks + 1, len(rows)]
+                for i, j in zip(first.tolist(), last.tolist()):
+                    lo, hi = int(rows[i]), int(rows[j - 1]) + 1
+                    contiguous = hi - lo == j - i
+                    local = None if contiguous else rows[i:j] - lo
+                    for n in names:
+                        values = d[_SCENE if n == "scene" else n][lo:hi]
+                        out[n].append(values if contiguous else values[local])
+        raw = {n: (np.concatenate(v) if v else np.array([])) for n, v in out.items()}
+        raw["trajectory_id"] = t["ids"][np.searchsorted(t["offset"], rows, side="right") - 1]
+        return raw
+
     def _decode(self, raw) -> pd.DataFrame:
         frame = {}
         for name, values in raw.items():
             if name == "time":
                 frame[name] = pd.to_datetime(np.rint(values * 1e3).astype("int64"), unit="ms", utc=True).astype("datetime64[ns, UTC]")
             elif name == "scene":
-                frame[name] = self._names()[values]
+                frame[name] = pd.Categorical.from_codes(values, categories=self._names())
             elif name == "interpolated":
                 frame[name] = pd.array(np.where(values < 0, 0, values).astype(bool), dtype="boolean")
                 frame[name][values < 0] = pd.NA
@@ -197,20 +235,11 @@ class LimosatTrajectories:
         frame.attrs.update(self.metadata)
         return frame
 
-    @staticmethod
-    def _time_mask(frame, start, stop):
-        keep = np.ones(len(frame), dtype=bool)
-        if start is not None:
-            keep &= (frame["time"] >= start).to_numpy()
-        if stop is not None:
-            keep &= (frame["time"] < stop).to_numpy()
-        return keep
-
     # ----------------------------------------------------------------------------------------- readers
 
     def read_points(self, *, start=None, stop=None, trajectory_ids=None, columns=None, primary_only=False,
                     max_rows=None) -> pd.DataFrame:
-        """Observations with ``start <= time < stop`` (UTC; naive dates are UTC), sorted by time.
+        """Observations with ``start <= time < stop`` (UTC; naive dates are UTC), sorted by time (ties keep the file order: trajectory start time, then ``point_index``).
 
         ``columns`` is None for the core columns (``CORE_COLUMNS``), ``"all"`` for every variable, or a list of names.
         ``primary_only`` keeps rows in the period's own window. ``trajectory_ids`` are unique within this period only.
@@ -218,17 +247,14 @@ class LimosatTrajectories:
         start, stop = _bounds(start, stop)
         _limit(max_rows)
         columns = resolve_columns(columns, ("trajectory_id", *OBS_COLUMNS), CORE_COLUMNS)
-        need = [*columns, "time", "point_index"] + (["is_primary"] if primary_only else [])
         selected = self._candidates(start, stop)
         if trajectory_ids is not None:
             selected = np.intersect1d(selected, self._index_of(trajectory_ids))
-        frame = self._read(selected, need)
-        keep = self._time_mask(frame, start, stop)
-        if primary_only:
-            keep &= frame["is_primary"].fillna(False).to_numpy(bool)
-        frame = frame[keep].sort_values(["time", "trajectory_id", "point_index"], kind="stable")
+        raw = self._read_rows(selected, [*columns, "time"], start, stop, primary_only)
+        order = np.argsort(raw["time"], kind="stable")  # ties keep the file order: trajectory start time, then point_index
         if max_rows is not None:
-            frame = frame.iloc[:max_rows]
+            order = order[:max_rows]
+        frame = self._decode({name: values[order] for name, values in raw.items()})
         return self._attrs(frame[columns].reset_index(drop=True))
 
     def read_trajectories(self, *, start=None, stop=None, xlim=None, ylim=None, trajectory_ids=None, columns=None,
@@ -247,8 +273,8 @@ class LimosatTrajectories:
             selected = self._candidates(start, stop)
             if trajectory_ids is not None:
                 selected = np.intersect1d(selected, self._index_of(trajectory_ids))
-            probe = self._read(selected, ["time", "x_m", "y_m"])
-            hit = self._time_mask(probe, start, stop)
+            probe = self._decode(self._read_rows(selected, ["time", "x_m", "y_m"], start, stop))
+            hit = np.ones(len(probe), dtype=bool)
             if xlim is not None:
                 hit &= ((probe["x_m"] >= xlim[0]) & (probe["x_m"] <= xlim[1])).to_numpy()
             if ylim is not None:
