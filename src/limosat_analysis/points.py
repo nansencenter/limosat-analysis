@@ -22,34 +22,11 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
+from .columns import (CORE_COLUMNS, CORE_DISPLACEMENT_COLUMNS, DISPLACEMENT_COLUMNS, SUPPORTED_MAJOR_VERSION, bounds as _bounds, limit as _limit, resolve_columns) 
 
-SUPPORTED_MAJOR_VERSION = 2
+
 REQUIRED_COLUMNS = ("trajectory_id", "point_index", "time", "x_m", "y_m")
-DISPLACEMENT_COLUMNS = (
-    "dx_m", "dy_m", "speed_m_per_day", "interpolated", "correlation", "direct_match_share", "quality_flags",
-)
 NULLABLE_TYPES = {pa.bool_(): pd.BooleanDtype(), pa.uint8(): pd.UInt8Dtype()}.get
-
-
-def _utc(value):
-    if value is None:
-        return None
-    timestamp = pd.Timestamp(value)
-    if pd.isna(timestamp):
-        raise ValueError("Time bounds must not be NaT")
-    return timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
-
-
-def _bounds(start, stop):
-    start, stop = _utc(start), _utc(stop)
-    if start is not None and stop is not None and start >= stop:
-        raise ValueError("Expected start < stop (stop is exclusive)")
-    return start, stop
-
-
-def _limit(max_rows):
-    if max_rows is not None and (isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows < 1):
-        raise ValueError("max_rows must be a positive integer")
 
 
 def _time_expression(field, start, stop):
@@ -160,13 +137,14 @@ class LimosatTrajectories:
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)
-        self._check_columns(columns)
-        scanner = self._dataset.scanner(columns=list(columns) if columns else None,
-                                        filter=self._filter(start, stop, trajectory_ids, primary_only))
-        table = scanner.head(max_rows) if max_rows is not None else scanner.to_table()
-        frame = self._frame(table)
-        keys = [k for k in ("time", "trajectory_id", "point_index") if k in frame]
-        return self._attrs(frame.sort_values(keys, kind="stable").reset_index(drop=True))
+        columns = resolve_columns(columns, self._schema.names, CORE_COLUMNS)
+        scan = list(dict.fromkeys([*columns, "time", "trajectory_id", "point_index"]))
+        scanner = self._dataset.scanner(columns=scan, filter=self._filter(start, stop, trajectory_ids, primary_only))
+        frame = self._frame(scanner.to_table())
+        frame = frame.sort_values(["time", "trajectory_id", "point_index"], kind="stable")
+        if max_rows is not None:
+            frame = frame.iloc[:max_rows]
+        return self._attrs(frame[columns].reset_index(drop=True))
 
     def _trajectory_ids_with_rows(self, start, stop, xlim, ylim):
         columns = ["trajectory_id"] + (["x_m", "y_m"] if xlim or ylim else [])
@@ -189,7 +167,7 @@ class LimosatTrajectories:
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)
-        self._check_columns(columns)
+        columns = resolve_columns(columns, self._schema.names, CORE_COLUMNS)
         if start is not None or stop is not None or xlim is not None or ylim is not None:
             ids = self._trajectory_ids_with_rows(start, stop, xlim, ylim)
             if trajectory_ids is not None:
@@ -198,11 +176,10 @@ class LimosatTrajectories:
             ids = np.atleast_1d(trajectory_ids)
         else:
             raise ValueError("Give start/stop, xlim/ylim or trajectory_ids; to read everything use read_points()")
-        wanted = None if columns is None else list(dict.fromkeys(["trajectory_id", "point_index", *columns]))
+        wanted = list(dict.fromkeys(["trajectory_id", "point_index", *columns]))
         table = self._dataset.to_table(columns=wanted, filter=self._filter(None, None, ids, False))
         frame = self._frame(table).sort_values(["trajectory_id", "point_index"], kind="stable").reset_index(drop=True)
-        if columns is not None:
-            frame = frame[list(columns)]
+        frame = frame[columns]
         return self._attrs(frame.iloc[:max_rows] if max_rows is not None else frame)
 
     def read_displacements(self, *, start=None, stop=None, trajectory_ids=None, columns=None, primary_only=False,
@@ -214,7 +191,7 @@ class LimosatTrajectories:
         ``start_time``, ``end_time``, ``elapsed_seconds`` (derived from the two times), ``x0_m``, ``y0_m``, ``x1_m``,
         ``y1_m``, the displacement columns,
         ``start_scene``/``end_scene``, ``is_primary`` and ``period`` where the file has them.
-        ``exclude_flags`` names flags (see ``metadata['flag_bits']``) whose displacements are dropped; by
+        ``columns`` is None for the core columns, ``"all"`` or a list of names. ``exclude_flags`` names flags (see ``metadata['flag_bits']``) whose displacements are dropped; by
         default every displacement is returned.
         """
         start, stop = _bounds(start, stop)
@@ -264,12 +241,8 @@ class LimosatTrajectories:
         frame.attrs["excluded_flags"] = sorted(set(exclude_flags))
         if max_rows is not None:
             frame = frame.iloc[:max_rows]
-        if columns is not None:
-            missing = set(columns) - set(frame)
-            if missing:
-                raise ValueError(f"Unavailable columns: {sorted(missing)}")
-            frame = frame[list(columns)]
-        return self._attrs(frame.reset_index(drop=True))
+        columns = resolve_columns(columns, list(frame.columns), CORE_DISPLACEMENT_COLUMNS)
+        return self._attrs(frame[columns].reset_index(drop=True))
 
     def verify(self) -> bool:
         """Check this file's SHA-256 against ``manifest.json`` in the same folder (raises on mismatch)."""
@@ -288,16 +261,28 @@ class LimosatTrajectories:
         return True
 
 
-def open_limosat(path) -> LimosatTrajectories:
-    """Open one period file of the public LiMOSAT trajectory release (``limosat_<period>.parquet``)."""
+def open_limosat(path):
+    """Open one period file of the public LiMOSAT trajectory release.
+
+    ``limosat_<period>.nc`` (NetCDF4, the released format) and ``limosat_<period>.parquet`` (the same table as Parquet) are
+    both read through the same methods: ``read_points``, ``read_trajectories``, ``read_displacements``, ``describe``,
+    ``verify``. Reads return the core columns unless ``columns`` is given (a list of names, or ``"all"``).
+    """
     path = Path(path).expanduser()
     if not path.exists():
         raise FileNotFoundError(path)
     if path.is_dir():
-        raise ValueError("Open one period file, limosat_<period>.parquet; periods are not combined automatically")
+        raise ValueError("Open one period file, limosat_<period>.nc; periods are not combined automatically")
+    if path.suffix == ".nc":
+        from .netcdf import LimosatNetCDF, is_netcdf_file
+
+        if not is_netcdf_file(path):
+            raise ValueError(f"{path.name} is not a LiMOSAT trajectory file (NetCDF4 with schema_version and featureType "
+                             "trajectory attributes)")
+        return LimosatNetCDF(path)
     if not is_point_file(path):
         raise ValueError(
-            f"{path.name} is not a LiMOSAT trajectory file (Parquet with limosat.schema_version metadata). "
+            f"{path.name} is not a LiMOSAT trajectory file (NetCDF4, or Parquet with limosat.schema_version metadata). "
             "Raw tracking databases, the earlier benchmark Feather files and the internal QC v1 archive are not read "
             "by this version; use limosat-analysis commit 6d3694b for them (pandas.read_feather reads the Feather files)."
         )

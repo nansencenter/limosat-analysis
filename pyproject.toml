@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "limosat-analysis"
-version = "0.2.0"
+version = "0.3.0"
 description = "Readers and analysis examples for LiMOSAT trajectories"
 requires-python = ">=3.10"
-dependencies = ["numpy", "pandas>=2", "pyarrow>=12"]
+dependencies = ["numpy", "pandas>=2", "pyarrow>=12", "netCDF4"]
 
 [project.optional-dependencies]
 notebooks = ["matplotlib", "cartopy", "pyproj", "ipykernel"]
