@@ -1,130 +1,210 @@
-"""Reader for the public LiMOSAT trajectory files (schema 2): one Parquet point table per processing period.
+"""Reader for the public LiMOSAT trajectory release: one NetCDF4 file (CF trajectory, contiguous ragged array) per period.
 
-A row is one observation of a feature in one Sentinel-1 scene. The rows of a trajectory share
-``trajectory_id`` and are ordered by ``point_index`` (0 at the first observation). Every row after the first
-also describes the displacement from the previous observation (``dx_m``, ``dy_m``, ``speed_m_per_day``,
-``interpolated``, ``correlation``, ``direct_match_share``, ``quality_flags``). ``is_primary`` marks the rows in the
-period's own date window; selecting those rows from all periods covers each date once.
+One file holds one processing period. ``trajectory`` and ``obs`` are the two dimensions: ``rowsize`` gives the number
+of observations of each trajectory, trajectories are stored in order of their start time (``time_start``) and the
+observations of a trajectory in ``point_index`` order. A time window therefore reads as a few contiguous runs and one
+trajectory as a single slice. Every column is its own variable, so only the requested columns are read and decompressed.
 
-Everything the reader needs (schema version, flag names, window, CRS, column descriptions) is read from the
-file itself, so the reader carries no table of flags or periods.
+The reader needs ``netCDF4``. All metadata (schema version, flag names, primary window, descriptions) comes from the file.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.dataset as ds
-import pyarrow.parquet as pq
 
-from .columns import (CORE_COLUMNS, CORE_DISPLACEMENT_COLUMNS, DISPLACEMENT_COLUMNS, SUPPORTED_MAJOR_VERSION, bounds as _bounds, limit as _limit, resolve_columns) 
+from .columns import (CORE_COLUMNS, CORE_DISPLACEMENT_COLUMNS, DISPLACEMENT_COLUMNS, SUPPORTED_MAJOR_VERSION,
+                      bounds as _bounds, limit as _limit, resolve_columns)
 
+import netCDF4
 
-REQUIRED_COLUMNS = ("trajectory_id", "point_index", "time", "x_m", "y_m")
-NULLABLE_TYPES = {pa.bool_(): pd.BooleanDtype(), pa.uint8(): pd.UInt8Dtype()}.get
-
-
-def _time_expression(field, start, stop):
-    expression = ds.scalar(True)
-    if start is not None:
-        expression &= ds.field(field) >= pa.scalar(start, type=pa.timestamp("ns", tz="UTC"))
-    if stop is not None:
-        expression &= ds.field(field) < pa.scalar(stop, type=pa.timestamp("ns", tz="UTC"))
-    return expression
+OBS_COLUMNS = ("point_index", "time", "scene", "x_m", "y_m", "lon", "lat", "dx_m", "dy_m", "speed_m_per_day", "interpolated",
+               "correlation", "direct_match_share", "quality_flags", "is_primary")
+_SCENE = "scene_index"
 
 
 def is_point_file(path) -> bool:
-    """True if ``path`` is a Parquet file written in the public trajectory format (schema 2)."""
+    """True if ``path`` is a NetCDF4 file written in the public LiMOSAT format."""
     path = Path(path).expanduser()
-    if path.suffix != ".parquet" or not path.is_file():
+    if path.suffix != ".nc" or not path.is_file():
         return False
     try:
-        metadata = pq.ParquetFile(path).schema_arrow.metadata or {}
-    except (OSError, pa.ArrowException):
+        with netCDF4.Dataset(path) as d:
+            return "schema_version" in d.ncattrs() and getattr(d, "featureType", "") == "trajectory"
+    except OSError:
         return False
-    return b"limosat.schema_version" in metadata
-
-
-def _json(raw, key, default):
-    value = raw.get(key)
-    return json.loads(value) if value else default
 
 
 class LimosatTrajectories:
-    """A public LiMOSAT trajectory file: observations of one processing period, sorted by time."""
+    """A public LiMOSAT trajectory file (NetCDF4): the trajectories of one processing period."""
 
     def __init__(self, path):
         self.path = Path(path).expanduser().resolve()
         if not self.path.is_file():
             raise FileNotFoundError(self.path)
-        schema = pq.ParquetFile(self.path).schema_arrow
-        raw = schema.metadata or {}
-        version = raw.get(b"limosat.schema_version", b"").decode()
-        if not version:
-            raise ValueError("Not a LiMOSAT trajectory file: no limosat.schema_version in the Parquet metadata")
-        if int(version.split(".")[0]) != SUPPORTED_MAJOR_VERSION:
-            raise ValueError(f"Unsupported LiMOSAT schema {version}; this reader supports {SUPPORTED_MAJOR_VERSION}.x")
-        missing = set(REQUIRED_COLUMNS) - set(schema.names)
-        if missing:
-            raise ValueError(f"LiMOSAT trajectory file lacks columns {sorted(missing)}")
-        self._schema = schema
-        self._dataset = ds.dataset(self.path, format="parquet")
-        self.kind = "parquet_points"
-        self.metadata = {
-            "schema_version": version,
-            "release_id": raw.get(b"limosat.release_id", b"").decode() or None,
-            "period": raw.get(b"limosat.period", b"").decode() or None,
-            "crs": raw.get(b"limosat.crs", b"").decode() or None,
-            "flag_bits": _json(raw, b"limosat.flag_bits", {}),
-            "primary_window": _json(raw, b"limosat.primary_window", None),
-            "primary_policy": raw.get(b"limosat.primary_policy", b"").decode() or None,
-            "rows": pq.ParquetFile(self.path).metadata.num_rows,
-        }
+        self.kind = "netcdf_ragged"
+        self._index = None
+        self._scene_names = None
+        # The file is opened for each read and closed again: no handle is kept, so objects need no clean-up.
+        with self._dataset() as d:
+            attrs = set(d.ncattrs())
+            if "schema_version" not in attrs or getattr(d, "featureType", "") != "trajectory":
+                raise ValueError("Not a LiMOSAT trajectory file: no schema_version / featureType trajectory attributes")
+            if int(d.schema_version.split(".")[0]) != SUPPORTED_MAJOR_VERSION:
+                raise ValueError(f"Unsupported LiMOSAT schema {d.schema_version}; this reader supports {SUPPORTED_MAJOR_VERSION}.x")
+            flags = d["quality_flags"]
+            masks = [int(m) for m in np.atleast_1d(flags.flag_masks)]
+            names = flags.flag_meanings.split()
+            self.metadata = {
+                "schema_version": d.schema_version,
+                "release_id": getattr(d, "release_id", None),
+                "period": getattr(d, "period", None),
+                "crs": getattr(d["crs"], "epsg_code", None) if "crs" in d.variables else None,
+                "flag_bits": {name: int(np.log2(mask)) for name, mask in zip(names, masks)},
+                "primary_window": {"start": d.primary_window_start, "stop_exclusive": d.primary_window_stop_exclusive},
+                "primary_policy": getattr(d, "primary_rule", None),
+                "rows": int(d.dimensions["obs"].size),
+                "trajectories": int(d.dimensions["trajectory"].size),
+            }
+            self._gap = (d["time"].chunking() or [65_536])[0]
+
+    @contextmanager
+    def _dataset(self):
+        d = netCDF4.Dataset(self.path)
+        d.set_auto_maskandscale(False)
+        try:
+            yield d
+        finally:
+            d.close()
 
     def __repr__(self):
-        return f"LimosatTrajectories({self.path.name!r}, period={self.metadata['period']!r}, rows={self.metadata['rows']:,})"
+        return (f"LimosatTrajectories({self.path.name!r}, period={self.metadata['period']!r}, rows={self.metadata['rows']:,}, "
+                f"trajectories={self.metadata['trajectories']:,})")
+
+    def close(self):
+        """Nothing to close: the file is opened only while a read runs. Kept so that ``with open_limosat(...)`` works."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return None
 
     # ----------------------------------------------------------------------------------------- helpers
 
     def describe(self) -> pd.DataFrame:
-        """Column name, type, unit and description, as recorded in the file."""
+        """Variable name, type, unit and description, as recorded in the file."""
         rows = []
-        for field in self._schema:
-            meta = field.metadata or {}
-            rows.append({"column": field.name, "type": str(field.type), "unit": meta.get(b"unit", b"").decode(),
-                         "description": meta.get(b"description", b"").decode()})
+        with self._dataset() as d:
+            for name in ("trajectory_id", *OBS_COLUMNS):
+                variable = d[_SCENE if name == "scene" else name]
+                rows.append({"column": name, "type": str(variable.dtype), "unit": getattr(variable, "units", ""),
+                             "description": getattr(d["scene_name"] if name == "scene" else variable, "long_name", "")})
         return pd.DataFrame(rows)
 
-    def _check_columns(self, columns):
-        if columns is not None:
-            missing = set(columns) - set(self._schema.names)
-            if missing:
-                raise ValueError(f"Unavailable columns: {sorted(missing)}")
+    def _traj(self):
+        if self._index is None:
+            with self._dataset() as d:
+                rowsize = d["rowsize"][:].astype(np.int64)
+                self._index = dict(ids=d["trajectory_id"][:], rowsize=rowsize, tstart=d["time_start"][:], tend=d["time_end"][:],
+                                   offset=np.r_[0, np.cumsum(rowsize)])
+        return self._index
 
-    def _frame(self, table) -> pd.DataFrame:
-        frame = table.to_pandas(types_mapper=NULLABLE_TYPES)
-        if "time" in frame:
-            frame["time"] = frame["time"].astype("datetime64[ns, UTC]")
-        return frame
+    def _names(self):
+        if self._scene_names is None:
+            with self._dataset() as d:
+                self._scene_names = np.array(list(d["scene_name"][:]), dtype=object)
+        return self._scene_names
 
-    def _filter(self, start, stop, trajectory_ids, primary_only):
-        expression = _time_expression("time", start, stop)
-        if trajectory_ids is not None:
-            expression &= ds.field("trajectory_id").isin([int(i) for i in np.atleast_1d(trajectory_ids)])
-        if primary_only:
-            if "is_primary" not in self._schema.names:
-                raise ValueError("This file has no is_primary column")
-            expression &= ds.field("is_primary")
-        return expression
+    def _runs(self, selected):
+        """Contiguous (first trajectory, last trajectory + 1) groups of the selected trajectory indices, merging small gaps."""
+        if len(selected) == 0:
+            return []
+        t = self._traj()
+        runs, first, last = [], selected[0], selected[0]
+        for i in selected[1:]:
+            if t["offset"][i] - t["offset"][last + 1] <= self._gap:
+                last = i
+            else:
+                runs.append((first, last + 1))
+                first = last = i
+        runs.append((first, last + 1))
+        return runs
+
+    def _read(self, selected, names) -> pd.DataFrame:
+        """All observations of the trajectories ``selected`` (sorted indices), as a frame with ``trajectory_id`` and ``names``."""
+        t = self._traj()
+        selected = np.asarray(selected, dtype=np.int64)
+        names = [n for n in dict.fromkeys(names) if n != "trajectory_id"]
+        parts = {n: [] for n in names}
+        ids = []
+        wanted = np.zeros(len(t["ids"]), dtype=bool)
+        wanted[selected] = True
+        with self._dataset() as d:
+            for a, b in self._runs(selected):
+                lo, hi = t["offset"][a], t["offset"][b]
+                keep = np.repeat(wanted[a:b], t["rowsize"][a:b])
+                everything = bool(keep.all())
+                ids.append(np.repeat(t["ids"][a:b], t["rowsize"][a:b])[keep])
+                for n in names:
+                    values = d[_SCENE if n == "scene" else n][lo:hi]
+                    parts[n].append(values if everything else values[keep])
+        out = {"trajectory_id": np.concatenate(ids) if ids else np.array([], dtype=np.int64)}
+        for n in names:
+            out[n] = np.concatenate(parts[n]) if parts[n] else np.array([])
+        return self._decode(out)
+
+    def _decode(self, raw) -> pd.DataFrame:
+        frame = {}
+        for name, values in raw.items():
+            if name == "time":
+                frame[name] = pd.to_datetime(np.rint(values * 1e3).astype("int64"), unit="ms", utc=True).astype("datetime64[ns, UTC]")
+            elif name == "scene":
+                frame[name] = self._names()[values]
+            elif name == "interpolated":
+                frame[name] = pd.array(np.where(values < 0, 0, values).astype(bool), dtype="boolean")
+                frame[name][values < 0] = pd.NA
+            elif name == "quality_flags":
+                frame[name] = pd.array(np.where(values == 255, 0, values), dtype="UInt8")
+                frame[name][values == 255] = pd.NA
+            elif name == "is_primary":
+                frame[name] = pd.array(values.astype(bool), dtype="boolean")
+            else:
+                frame[name] = values
+        return pd.DataFrame(frame)
+
+    def _candidates(self, start, stop):
+        """Indices of trajectories that overlap [start, stop) in time (all of them without bounds)."""
+        t = self._traj()
+        keep = np.ones(len(t["ids"]), dtype=bool)
+        if start is not None:
+            keep &= t["tend"] >= start.timestamp()
+        if stop is not None:
+            keep &= t["tstart"] < stop.timestamp()
+        return np.flatnonzero(keep)
+
+    def _index_of(self, trajectory_ids):
+        t = self._traj()
+        wanted = np.atleast_1d(trajectory_ids).astype(np.int64)
+        return np.flatnonzero(np.isin(t["ids"], wanted))
 
     def _attrs(self, frame):
         frame.attrs.update(self.metadata)
         return frame
+
+    @staticmethod
+    def _time_mask(frame, start, stop):
+        keep = np.ones(len(frame), dtype=bool)
+        if start is not None:
+            keep &= (frame["time"] >= start).to_numpy()
+        if stop is not None:
+            keep &= (frame["time"] < stop).to_numpy()
+        return keep
 
     # ----------------------------------------------------------------------------------------- readers
 
@@ -132,53 +212,53 @@ class LimosatTrajectories:
                     max_rows=None) -> pd.DataFrame:
         """Observations with ``start <= time < stop`` (UTC; naive dates are UTC), sorted by time.
 
-        ``primary_only`` keeps rows in the period's own window. ``trajectory_ids`` are unique within this
-        period only.
+        ``columns`` is None for the core columns (``CORE_COLUMNS``), ``"all"`` for every variable, or a list of names.
+        ``primary_only`` keeps rows in the period's own window. ``trajectory_ids`` are unique within this period only.
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)
-        columns = resolve_columns(columns, self._schema.names, CORE_COLUMNS)
-        scan = list(dict.fromkeys([*columns, "time", "trajectory_id", "point_index"]))
-        scanner = self._dataset.scanner(columns=scan, filter=self._filter(start, stop, trajectory_ids, primary_only))
-        frame = self._frame(scanner.to_table())
-        frame = frame.sort_values(["time", "trajectory_id", "point_index"], kind="stable")
+        columns = resolve_columns(columns, ("trajectory_id", *OBS_COLUMNS), CORE_COLUMNS)
+        need = [*columns, "time", "point_index"] + (["is_primary"] if primary_only else [])
+        selected = self._candidates(start, stop)
+        if trajectory_ids is not None:
+            selected = np.intersect1d(selected, self._index_of(trajectory_ids))
+        frame = self._read(selected, need)
+        keep = self._time_mask(frame, start, stop)
+        if primary_only:
+            keep &= frame["is_primary"].fillna(False).to_numpy(bool)
+        frame = frame[keep].sort_values(["time", "trajectory_id", "point_index"], kind="stable")
         if max_rows is not None:
             frame = frame.iloc[:max_rows]
         return self._attrs(frame[columns].reset_index(drop=True))
-
-    def _trajectory_ids_with_rows(self, start, stop, xlim, ylim):
-        columns = ["trajectory_id"] + (["x_m", "y_m"] if xlim or ylim else [])
-        table = self._dataset.to_table(columns=columns, filter=self._filter(start, stop, None, False))
-        frame = table.to_pandas()
-        if xlim is not None:
-            frame = frame[(frame.x_m >= xlim[0]) & (frame.x_m <= xlim[1])]
-        if ylim is not None:
-            frame = frame[(frame.y_m >= ylim[0]) & (frame.y_m <= ylim[1])]
-        return np.unique(frame["trajectory_id"].to_numpy())
 
     def read_trajectories(self, *, start=None, stop=None, xlim=None, ylim=None, trajectory_ids=None, columns=None,
                           max_rows=None) -> pd.DataFrame:
         """Complete trajectories: every observation of each trajectory that has an observation in the window.
 
-        ``start``/``stop`` select by observation time and ``xlim``/``ylim`` (EPSG:3413 metres) by position;
-        an observation inside both makes the whole trajectory part of the result. The result is ordered by
-        ``trajectory_id`` and ``point_index``, so ``groupby('trajectory_id')`` yields one track at a time.
-        Give ``trajectory_ids`` alone to read specific trajectories.
+        ``start``/``stop`` select by observation time and ``xlim``/``ylim`` (EPSG:3413 metres) by position; an
+        observation inside both makes the whole trajectory part of the result. The result is ordered by trajectory
+        start time and ``point_index``, so ``groupby('trajectory_id')`` yields one track at a time. Give
+        ``trajectory_ids`` alone to read specific trajectories.
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)
-        columns = resolve_columns(columns, self._schema.names, CORE_COLUMNS)
+        columns = resolve_columns(columns, ("trajectory_id", *OBS_COLUMNS), CORE_COLUMNS)
         if start is not None or stop is not None or xlim is not None or ylim is not None:
-            ids = self._trajectory_ids_with_rows(start, stop, xlim, ylim)
+            selected = self._candidates(start, stop)
             if trajectory_ids is not None:
-                ids = np.intersect1d(ids, np.atleast_1d(trajectory_ids))
+                selected = np.intersect1d(selected, self._index_of(trajectory_ids))
+            probe = self._read(selected, ["time", "x_m", "y_m"])
+            hit = self._time_mask(probe, start, stop)
+            if xlim is not None:
+                hit &= ((probe["x_m"] >= xlim[0]) & (probe["x_m"] <= xlim[1])).to_numpy()
+            if ylim is not None:
+                hit &= ((probe["y_m"] >= ylim[0]) & (probe["y_m"] <= ylim[1])).to_numpy()
+            selected = self._index_of(np.unique(probe["trajectory_id"].to_numpy()[hit]))
         elif trajectory_ids is not None:
-            ids = np.atleast_1d(trajectory_ids)
+            selected = self._index_of(trajectory_ids)
         else:
             raise ValueError("Give start/stop, xlim/ylim or trajectory_ids; to read everything use read_points()")
-        wanted = list(dict.fromkeys(["trajectory_id", "point_index", *columns]))
-        table = self._dataset.to_table(columns=wanted, filter=self._filter(None, None, ids, False))
-        frame = self._frame(table).sort_values(["trajectory_id", "point_index"], kind="stable").reset_index(drop=True)
+        frame = self._read(selected, [*columns, "point_index"])
         frame = frame[columns]
         return self._attrs(frame.iloc[:max_rows] if max_rows is not None else frame)
 
@@ -186,13 +266,12 @@ class LimosatTrajectories:
                            exclude_flags=(), max_rows=None) -> pd.DataFrame:
         """One row per displacement between consecutive observations of a trajectory.
 
-        ``start <= start_time < stop`` selects by the time the displacement starts, which is also what
-        ``is_primary`` is defined on. Columns: ``trajectory_id``, ``point_index`` (of the end observation),
-        ``start_time``, ``end_time``, ``elapsed_seconds`` (derived from the two times), ``x0_m``, ``y0_m``, ``x1_m``,
-        ``y1_m``, the displacement columns,
-        ``start_scene``/``end_scene``, ``is_primary`` and ``period`` where the file has them.
-        ``columns`` is None for the core columns, ``"all"`` or a list of names. ``exclude_flags`` names flags (see ``metadata['flag_bits']``) whose displacements are dropped; by
-        default every displacement is returned.
+        ``start <= start_time < stop`` selects by the time the displacement starts, which is also what ``is_primary`` is
+        defined on. Columns: ``trajectory_id``, ``point_index`` (of the end observation), ``start_time``, ``end_time``,
+        ``elapsed_seconds``, ``x0_m``, ``y0_m``, ``x1_m``, ``y1_m``, the displacement columns, ``start_scene``/``end_scene``,
+        ``is_primary``, ``lon``/``lat`` of the end observation. ``columns`` is None for ``CORE_DISPLACEMENT_COLUMNS``,
+        ``"all"`` or a list of names. ``exclude_flags`` names flags (see ``metadata['flag_bits']``) whose displacements
+        are dropped.
         """
         start, stop = _bounds(start, stop)
         _limit(max_rows)
@@ -202,14 +281,23 @@ class LimosatTrajectories:
         unknown = set(exclude_flags) - set(bits)
         if unknown:
             raise ValueError(f"Unknown flags: {sorted(unknown)}; this file declares {sorted(bits)}")
-        if start is not None or stop is not None:
-            ids = self._trajectory_ids_with_rows(start, stop, None, None)
-            if trajectory_ids is not None:
-                ids = np.intersect1d(ids, np.atleast_1d(trajectory_ids))
-        else:
-            ids = trajectory_ids
-        rows = self._frame(self._dataset.to_table(filter=self._filter(None, None, ids, False)))
-        rows = rows.sort_values(["trajectory_id", "point_index"], kind="stable").reset_index(drop=True)
+        available = ("trajectory_id", "point_index", "start_time", "end_time", "elapsed_seconds", "x0_m", "y0_m", "x1_m",
+                     "y1_m", *DISPLACEMENT_COLUMNS, "start_scene", "end_scene", "is_primary", "lon", "lat")
+        columns = resolve_columns(columns, available, CORE_DISPLACEMENT_COLUMNS)
+        need = ["time", "point_index", "x_m", "y_m"]
+        for name in columns:
+            if name in DISPLACEMENT_COLUMNS or name in ("is_primary", "lon", "lat"):
+                need.append(name)
+        if any(c in columns for c in ("start_scene", "end_scene")):
+            need.append("scene")
+        if primary_only:
+            need.append("is_primary")
+        if exclude_flags:
+            need.append("quality_flags")
+        selected = self._candidates(start, stop)
+        if trajectory_ids is not None:
+            selected = np.intersect1d(selected, self._index_of(trajectory_ids))
+        rows = self._read(selected, need)
         previous = rows.groupby("trajectory_id", sort=False).shift(1)
         has_previous = previous["time"].notna().to_numpy()
         end, before = rows[has_previous], previous[has_previous]
@@ -217,22 +305,17 @@ class LimosatTrajectories:
                               "start_time": before["time"], "end_time": end["time"],
                               "elapsed_seconds": (end["time"] - before["time"]).dt.total_seconds(),
                               "x0_m": before["x_m"], "y0_m": before["y_m"], "x1_m": end["x_m"], "y1_m": end["y_m"]})
-        for name in DISPLACEMENT_COLUMNS:
+        for name in (*DISPLACEMENT_COLUMNS, "is_primary", "lon", "lat"):
             if name in end:
                 frame[name] = end[name]
         if "scene" in end:
             frame["start_scene"], frame["end_scene"] = before["scene"], end["scene"]
-        for name in ("is_primary", "period"):
-            if name in end:
-                frame[name] = end[name]
         keep = pd.Series(True, index=frame.index)
         if start is not None:
             keep &= frame["start_time"] >= start
         if stop is not None:
             keep &= frame["start_time"] < stop
         if primary_only:
-            if "is_primary" not in frame:
-                raise ValueError("This file has no is_primary column")
             keep &= frame["is_primary"].fillna(False).astype(bool)
         if exclude_flags:
             mask = sum(1 << bits[name] for name in set(exclude_flags))
@@ -241,7 +324,6 @@ class LimosatTrajectories:
         frame.attrs["excluded_flags"] = sorted(set(exclude_flags))
         if max_rows is not None:
             frame = frame.iloc[:max_rows]
-        columns = resolve_columns(columns, list(frame.columns), CORE_DISPLACEMENT_COLUMNS)
         return self._attrs(frame[columns].reset_index(drop=True))
 
     def verify(self) -> bool:
@@ -261,29 +343,22 @@ class LimosatTrajectories:
         return True
 
 
-def open_limosat(path):
-    """Open one period file of the public LiMOSAT trajectory release.
+def open_limosat(path) -> LimosatTrajectories:
+    """Open one period file of the public LiMOSAT trajectory release (``limosat_<period>.nc``).
 
-    ``limosat_<period>.nc`` (NetCDF4, the released format) and ``limosat_<period>.parquet`` (the same table as Parquet) are
-    both read through the same methods: ``read_points``, ``read_trajectories``, ``read_displacements``, ``describe``,
-    ``verify``. Reads return the core columns unless ``columns`` is given (a list of names, or ``"all"``).
+    Reads return the core columns (``CORE_COLUMNS``) unless ``columns`` is a list of names or ``"all"``. The methods are
+    ``read_points``, ``read_trajectories``, ``read_displacements``, ``describe`` and ``verify``.
     """
     path = Path(path).expanduser()
     if not path.exists():
         raise FileNotFoundError(path)
     if path.is_dir():
         raise ValueError("Open one period file, limosat_<period>.nc; periods are not combined automatically")
-    if path.suffix == ".nc":
-        from .netcdf import LimosatNetCDF, is_netcdf_file
-
-        if not is_netcdf_file(path):
-            raise ValueError(f"{path.name} is not a LiMOSAT trajectory file (NetCDF4 with schema_version and featureType "
-                             "trajectory attributes)")
-        return LimosatNetCDF(path)
     if not is_point_file(path):
         raise ValueError(
-            f"{path.name} is not a LiMOSAT trajectory file (NetCDF4, or Parquet with limosat.schema_version metadata). "
-            "Raw tracking databases, the earlier benchmark Feather files and the internal QC v1 archive are not read "
-            "by this version; use limosat-analysis commit 6d3694b for them (pandas.read_feather reads the Feather files)."
+            f"{path.name} is not a LiMOSAT trajectory file (NetCDF4 with schema_version and featureType trajectory attributes). "
+            "Raw tracking databases, the earlier benchmark Feather files, the internal QC v1 archive and the Parquet versions of "
+            "the release are not read by this version; use limosat-analysis 0.2.0 for the Parquet release and commit 6d3694b for "
+            "the older sources (pandas.read_feather reads the Feather files)."
         )
     return LimosatTrajectories(path)

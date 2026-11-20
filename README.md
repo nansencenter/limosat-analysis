@@ -10,8 +10,7 @@ The release is one NetCDF4 file per processing period, `limosat_<period>.nc`, wi
 (featureType `trajectory`, contiguous ragged arrays) and describe themselves, so `ncdump -h`, xarray, MATLAB, R
 and any other NetCDF tool can read them. Every column is its own variable, so a reader that wants only a few of
 them decompresses only those. This package adds trajectory-aware access on top (date and space-time windows,
-whole trajectories, displacements with both ends, flag filters, checksum verification). It also reads the same
-table as Parquet (`limosat_<period>.parquet`), through identical methods.
+whole trajectories, displacements with both ends, flag filters, checksum verification).
 
 A row is one **observation** of a feature in one Sentinel-1 scene. The rows of a trajectory share
 `trajectory_id` and are ordered by `point_index` (0 at the first observation), so a trajectory is read as an
@@ -42,7 +41,7 @@ environment:
 python -m pip install -e ".[notebooks]"
 ```
 
-The reader requires Python 3.10+, NumPy, pandas, PyArrow and netCDF4. The notebook extra adds Matplotlib, Cartopy,
+The reader requires Python 3.10+, NumPy, pandas and netCDF4. The notebook extra adds Matplotlib, Cartopy,
 pyproj and a Jupyter kernel. For the reader alone, use `python -m pip install -e .`.
 
 ## Reading a period
@@ -78,7 +77,7 @@ moves = data.read_displacements(start="2024-01-01", stop="2024-02-01",
 | --- | --- |
 | `read_points(start, stop, trajectory_ids, columns, primary_only, max_rows)` | observations, sorted by time; core columns unless `columns` is a list or `"all"` |
 | `read_trajectories(start, stop, xlim, ylim, trajectory_ids, columns, max_rows)` | every observation of each trajectory that has one in the window, ordered by `trajectory_id` and `point_index` |
-| `read_displacements(start, stop, trajectory_ids, columns, primary_only, exclude_flags, max_rows)` | one row per displacement: `trajectory_id`, `point_index` (of the end), `start_time`, `end_time`, `elapsed_seconds`, `x0_m`, `y0_m`, `x1_m`, `y1_m`, the displacement columns, `start_scene`, `end_scene`, `is_primary`, `lon`/`lat` (NetCDF) or `period` (Parquet); core columns by default |
+| `read_displacements(start, stop, trajectory_ids, columns, primary_only, exclude_flags, max_rows)` | one row per displacement: `trajectory_id`, `point_index` (of the end), `start_time`, `end_time`, `elapsed_seconds`, `x0_m`, `y0_m`, `x1_m`, `y1_m`, the displacement columns, `start_scene`, `end_scene`, `is_primary`, `lon`, `lat`; core columns by default |
 | `describe()`, `verify()` | the column dictionary recorded in the file; a checksum check against `manifest.json` |
 
 - Dates are UTC and half-open: `start <= t < stop`. Naive dates are UTC. For `read_points` and
@@ -123,8 +122,7 @@ python -m pip install -e ".[test]"
 python -m pytest -q
 ```
 
-The tests build the same small synthetic table as NetCDF and as Parquet, run every reader test on both and check that
-they return identical frames. They cover opening and metadata, time and
+The tests build a small synthetic NetCDF file in the release layout and cover opening and metadata, time and
 trajectory filters, complete trajectories through a space-time window, displacements and flags, version and
 column checks, checksum verification and rejection of other sources. Local inputs and outputs belong in
 ignored `data/` and `outputs/` directories.
