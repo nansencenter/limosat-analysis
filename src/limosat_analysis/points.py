@@ -77,6 +77,7 @@ class LimosatTrajectories:
     def _dataset(self):
         d = netCDF4.Dataset(self.path)
         d.set_auto_maskandscale(False)
+        d.set_auto_chartostring(False)
         try:
             yield d
         finally:
@@ -118,7 +119,7 @@ class LimosatTrajectories:
     def _names(self):
         if self._scene_names is None:
             with self._dataset() as d:
-                self._scene_names = np.array(list(d["scene_name"][:]), dtype=object)
+                self._scene_names = np.array(netCDF4.chartostring(d["scene_name"][:], encoding="ascii").tolist(), dtype=object)
         return self._scene_names
 
     def _runs(self, selected):

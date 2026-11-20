@@ -76,8 +76,10 @@ def write_netcdf(path, rows=ROWS, version="2.0.0"):
     v[:] = [255 if r[12] is None else r[12] for r in obs]
     d.createVariable("is_primary", "i1", ("obs",))[:] = [int(r[13]) for r in obs]
     d.createVariable("scene_index", "i4", ("obs",))[:] = [scenes.index(r[3]) for r in obs]
-    v = d.createVariable("scene_name", str, ("scene",)); v.long_name = "scene text"
-    v[:] = np.array([scene(i) for i in scenes], dtype=object)
+    width = max(len(scene(i)) for i in scenes)
+    d.createDimension("scene_strlen", width)
+    v = d.createVariable("scene_name", "S1", ("scene", "scene_strlen")); v.long_name = "scene text"; v._Encoding = "ascii"
+    v[:] = netCDF4.stringtochar(np.array([scene(i).encode() for i in scenes], dtype=f"S{width}"))
     d.close()
 
 
